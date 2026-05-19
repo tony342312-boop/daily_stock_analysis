@@ -641,6 +641,11 @@ class Config:
     feishu_webhook_url: Optional[str] = None
     feishu_webhook_secret: Optional[str] = None  # 自定义机器人签名密钥（可选）
     feishu_webhook_keyword: Optional[str] = None  # 自定义机器人关键词（可选）
+    feishu_feedback_webhook_url: Optional[str] = None
+    feishu_feedback_webhook_secret: Optional[str] = None
+    feishu_feedback_webhook_keyword: Optional[str] = None
+    feishu_feedback_receive_id: Optional[str] = None
+    feishu_feedback_receive_id_type: str = "open_id"
     
     # Telegram 配置（需要同时配置 Bot Token 和 Chat ID）
     telegram_bot_token: Optional[str] = None  # Bot Token（@BotFather 获取）
@@ -1410,6 +1415,11 @@ class Config:
             feishu_webhook_url=os.getenv('FEISHU_WEBHOOK_URL'),
             feishu_webhook_secret=os.getenv('FEISHU_WEBHOOK_SECRET'),
             feishu_webhook_keyword=os.getenv('FEISHU_WEBHOOK_KEYWORD'),
+            feishu_feedback_webhook_url=os.getenv('FEISHU_FEEDBACK_WEBHOOK_URL'),
+            feishu_feedback_webhook_secret=os.getenv('FEISHU_FEEDBACK_WEBHOOK_SECRET'),
+            feishu_feedback_webhook_keyword=os.getenv('FEISHU_FEEDBACK_WEBHOOK_KEYWORD'),
+            feishu_feedback_receive_id=os.getenv('FEISHU_FEEDBACK_RECEIVE_ID'),
+            feishu_feedback_receive_id_type=os.getenv('FEISHU_FEEDBACK_RECEIVE_ID_TYPE', 'open_id'),
             telegram_bot_token=os.getenv('TELEGRAM_BOT_TOKEN'),
             telegram_chat_id=os.getenv('TELEGRAM_CHAT_ID'),
             telegram_message_thread_id=os.getenv('TELEGRAM_MESSAGE_THREAD_ID'),
