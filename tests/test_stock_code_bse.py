@@ -108,6 +108,11 @@ class TestNormalizeStockCode(unittest.TestCase):
         self.assertEqual(normalize_stock_code("hk1810"), "HK01810")
         self.assertEqual(normalize_stock_code("HK700"), "HK00700")
 
+    def test_us_suffix_normalizes_to_ticker(self):
+        """US autocomplete suffixes should not route into CN data sources."""
+        self.assertEqual(normalize_stock_code("AAPL.US"), "AAPL")
+        self.assertEqual(normalize_stock_code("meta.us"), "META")
+
 
 @unittest.skipIf(not _TUSHARE_IMPORTS_OK, f"tushare fetcher imports failed: {_TUSHARE_IMPORT_ERROR}")
 class TestTushareConvertStockCode(unittest.TestCase):

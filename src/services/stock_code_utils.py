@@ -90,6 +90,8 @@ def normalize_code(raw: str) -> Optional[str]:
         return None
     if text.isdigit() and len(text) in (5, 6):
         return text
+    if re.match(r"^[A-Z]{1,5}\.US$", text):
+        return text[:-3]
     if re.match(r"^[A-Z]{1,5}(?:\.(?:US|[A-Z]))?$", text):
         return text
     stripped_suffix = _strip_exchange_suffix(text)

@@ -12,6 +12,8 @@ Shared stock code -> name mapping, used by analyzer, data_provider, and name_to_
 # Stock code -> name mapping (common stocks)
 STOCK_NAME_MAP = {
     # === A-shares ===
+    "002335": "科华数据",
+    "600875": "东方电气",
     "600519": "贵州茅台",
     "000001": "平安银行",
     "300750": "宁德时代",
@@ -89,6 +91,8 @@ STOCK_NAME_MAP = {
     "LI": "理想汽车",
     "COIN": "Coinbase",
     "MSTR": "MicroStrategy",
+    "SE": "Sea Limited",
+    "LITE": "Lumentum Holdings Inc.",
     # === HK stocks (5-digit) ===
     "00700": "腾讯控股",
     "03690": "美团",

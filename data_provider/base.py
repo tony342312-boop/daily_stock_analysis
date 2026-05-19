@@ -79,6 +79,7 @@ def normalize_stock_code(stock_code: str) -> str:
     - 'HK00700'     -> 'HK00700'  (keep HK prefix for HK stocks)
     - '1810.HK'     -> 'HK01810'  (normalize HK suffix to canonical prefix form)
     - 'AAPL'        -> 'AAPL'     (keep US stock ticker as-is)
+    - 'AAPL.US'     -> 'AAPL'     (strip US market suffix)
 
     This function is applied at the DataProviderManager layer so that
     all individual fetchers receive a clean 6-digit code (for A-shares/ETFs).
@@ -112,6 +113,8 @@ def normalize_stock_code(stock_code: str) -> str:
             return f"HK{base.zfill(5)}"
         if suffix.upper() in ('SH', 'SZ', 'SS', 'BJ') and base.isdigit():
             return base
+        if suffix.upper() == 'US' and base.isalpha() and 1 <= len(base) <= 5:
+            return base.upper()
 
     return code
 

@@ -131,6 +131,12 @@ class TestResolveNameToCode:
         # "阿里巴巴" maps to both BABA and 09988 in STOCK_NAME_MAP
         assert resolve_name_to_code("阿里巴巴") is None
 
+    def test_frontend_stock_index_alias_match(self):
+        assert resolve_name_to_code("Lumentum") == "LITE"
+        assert resolve_name_to_code("Lumentum Holdings") == "LITE"
+        assert resolve_name_to_code("apple") == "AAPL"
+        assert resolve_name_to_code("Kehua Data") == "002335"
+
     @patch("src.services.name_to_code_resolver._get_akshare_name_to_code")
     def test_akshare_fallback_when_not_in_local(self, mock_akshare):
         mock_akshare.return_value = {"平安银行": "000001"}

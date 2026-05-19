@@ -81,7 +81,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-_SUPPORTED_FREE_TEXT_RE = re.compile(r"^[A-Za-z0-9.*\-+\u3400-\u9fff\s]+$")
+_SUPPORTED_FREE_TEXT_RE = re.compile(r"^[A-Za-z0-9.*\-+&/\u3400-\u9fff\s]+$")
 
 
 def _market_review_lock_path(config: Config) -> Path:
@@ -177,15 +177,21 @@ def _resolve_and_normalize_input(raw_value: str) -> str:
     if not text:
         return ""
 
-    if is_code_like(text):
-        return canonical_stock_code(text)
-
     if _is_obviously_invalid_analysis_input(text):
         raise _invalid_analysis_input_error()
 
     resolved = resolve_name_to_code(text)
     if resolved:
-        return canonical_stock_code(resolved)
+        canonical = canonical_stock_code(resolved)
+        if re.fullmatch(r"[A-Z]{1,5}\.US", canonical):
+            return canonical_stock_code(normalize_stock_code(canonical))
+        return canonical
+
+    if is_code_like(text):
+        canonical = canonical_stock_code(text)
+        if re.fullmatch(r"[A-Z]{1,5}\.US", canonical):
+            return canonical_stock_code(normalize_stock_code(canonical))
+        return canonical
 
     raise _invalid_analysis_input_error()
 
