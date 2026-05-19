@@ -17,6 +17,11 @@ export type AuthStatusResponse = {
   registrationInviteRequired?: boolean;
 };
 
+export type CaptchaResponse = {
+  question: string;
+  captchaToken: string;
+};
+
 export const authApi = {
   async getStatus(): Promise<AuthStatusResponse> {
     const { data } = await apiClient.get<AuthStatusResponse>('/api/v1/auth/status');
@@ -57,6 +62,29 @@ export const authApi = {
       body.username = username.trim();
     }
     await apiClient.post('/api/v1/auth/login', body);
+  },
+
+  async getCaptcha(): Promise<CaptchaResponse> {
+    const { data } = await apiClient.get<CaptchaResponse>('/api/v1/auth/captcha');
+    return data;
+  },
+
+  async register(
+    username: string,
+    password: string,
+    passwordConfirm: string,
+    captchaToken: string,
+    captchaAnswer: string,
+    inviteCode?: string
+  ): Promise<void> {
+    await apiClient.post('/api/v1/auth/register', {
+      username,
+      password,
+      passwordConfirm,
+      captchaToken,
+      captchaAnswer,
+      inviteCode,
+    });
   },
 
   async changePassword(

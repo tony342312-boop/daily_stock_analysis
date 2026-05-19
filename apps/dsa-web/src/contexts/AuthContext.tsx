@@ -15,7 +15,15 @@ type AuthContextValue = {
   registrationInviteRequired: boolean;
   isLoading: boolean;
   loadError: ParsedApiError | null;
-  login: (password: string, passwordConfirm?: string) => Promise<{ success: boolean; error?: ParsedApiError }>;
+  login: (password: string, passwordConfirm?: string, username?: string) => Promise<{ success: boolean; error?: ParsedApiError }>;
+  register: (
+    username: string,
+    password: string,
+    passwordConfirm: string,
+    captchaToken: string,
+    captchaAnswer: string,
+    inviteCode?: string
+  ) => Promise<{ success: boolean; error?: ParsedApiError }>;
   changePassword: (
     currentPassword: string,
     newPassword: string,
@@ -66,7 +74,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setCurrentUser(status.currentUser ?? null);
       setRegistrationEnabled(status.registrationEnabled ?? false);
       setRegistrationInviteRequired(status.registrationInviteRequired ?? false);
-      useStockPoolStore.getState().setHistoryAllUsers(status.currentUser?.role === 'admin');
+      useStockPoolStore.getState().setHistoryAllUsers?.(status.currentUser?.role === 'admin');
       if (status.authEnabled && !status.loggedIn) {
         useStockPoolStore.getState().resetDashboardState();
       }
@@ -80,7 +88,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setCurrentUser(null);
       setRegistrationEnabled(false);
       setRegistrationInviteRequired(false);
-      useStockPoolStore.getState().setHistoryAllUsers(false);
+      useStockPoolStore.getState().setHistoryAllUsers?.(false);
       useStockPoolStore.getState().resetDashboardState();
     } finally {
       setIsLoading(false);
@@ -94,10 +102,31 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const login = useCallback(
     async (
       password: string,
-      passwordConfirm?: string
+      passwordConfirm?: string,
+      username?: string
     ): Promise<{ success: boolean; error?: ParsedApiError }> => {
       try {
-        await authApi.login(password, passwordConfirm);
+        await authApi.login(password, passwordConfirm, username);
+        await fetchStatus();
+        return { success: true };
+      } catch (err: unknown) {
+        return { success: false, error: extractLoginError(err) };
+      }
+    },
+    [fetchStatus]
+  );
+
+  const register = useCallback(
+    async (
+      username: string,
+      password: string,
+      passwordConfirm: string,
+      captchaToken: string,
+      captchaAnswer: string,
+      inviteCode?: string
+    ): Promise<{ success: boolean; error?: ParsedApiError }> => {
+      try {
+        await authApi.register(username, password, passwordConfirm, captchaToken, captchaAnswer, inviteCode);
         await fetchStatus();
         return { success: true };
       } catch (err: unknown) {
@@ -152,6 +181,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         isLoading,
         loadError,
         login,
+        register,
         changePassword,
         logout,
         refreshStatus: fetchStatus,
