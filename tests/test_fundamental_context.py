@@ -39,7 +39,7 @@ class _DummyBoardFetcher:
 
 
 class TestFundamentalContext(unittest.TestCase):
-    def test_non_cn_market_returns_not_supported(self) -> None:
+    def test_hk_market_returns_not_supported(self) -> None:
         manager = DataFetcherManager(fetchers=[])
         cfg = SimpleNamespace(
             enable_fundamental_pipeline=True,
@@ -49,8 +49,8 @@ class TestFundamentalContext(unittest.TestCase):
             fundamental_retry_max=1,
         )
         with patch("src.config.get_config", return_value=cfg):
-            ctx = manager.get_fundamental_context("AAPL")
-        self.assertEqual(ctx["market"], "us")
+            ctx = manager.get_fundamental_context("HK00700")
+        self.assertEqual(ctx["market"], "hk")
         self.assertEqual(ctx["status"], "not_supported")
         self.assertEqual(ctx["coverage"].get("valuation"), "not_supported")
         self.assertEqual(ctx["coverage"].get("growth"), "not_supported")
@@ -59,6 +59,71 @@ class TestFundamentalContext(unittest.TestCase):
         self.assertEqual(ctx["coverage"].get("capital_flow"), "not_supported")
         self.assertEqual(ctx["coverage"].get("dragon_tiger"), "not_supported")
         self.assertEqual(ctx["coverage"].get("boards"), "not_supported")
+
+    def test_us_market_uses_sec_edgar_financial_context(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+            sec_edgar_enabled=True,
+            sec_edgar_user_agent="unit-test example@example.com",
+            sec_edgar_timeout_seconds=0.5,
+        )
+        sec_payload = {
+            "ticker": "META",
+            "cik": "0001326801",
+            "company_name": "Meta Platforms, Inc.",
+            "latest_filing": {"form": "10-Q", "filing_date": "2026-05-01"},
+            "latest_quarterly_filings": [{"form": "10-Q"}],
+            "latest_annual_filing": {"form": "10-K"},
+            "filing_references": [{"form": "10-Q", "sec_url": "https://www.sec.gov/test"}],
+            "recent_insider_filings": [{"form": "4"}],
+            "financial_report": {
+                "report_date": "2026-03-31",
+                "revenue": "$42.00B",
+                "net_profit_parent": "$14.00B",
+                "quarterly_trend": [{"period": "CY2026Q1", "revenue": "$42.00B"}],
+                "additional_metrics": {
+                    "gross_profit": {"value": "$34.00B", "source_tag": "GrossProfit"}
+                },
+            },
+            "dividend": {"ttm_cash_dividend_per_share": 2.0},
+            "source_chain": [{"provider": "sec_edgar", "result": "ok", "duration_ms": 0}],
+        }
+        quote = SimpleNamespace(
+            price=614.23,
+            change_pct=0.66,
+            pe_ratio=28.0,
+            pb_ratio=8.0,
+            total_mv=1.5e12,
+            circ_mv=1.5e12,
+            name="Meta",
+            source=SimpleNamespace(value="mock_quote"),
+        )
+
+        with patch("src.config.get_config", return_value=cfg), \
+                patch(
+                    "data_provider.sec_edgar.SecEdgarClient.get_company_context",
+                    return_value=sec_payload,
+                ), \
+                patch.object(manager, "get_realtime_quote", return_value=quote):
+            ctx = manager.get_fundamental_context("META.US")
+
+        self.assertEqual(ctx["market"], "us")
+        self.assertEqual(ctx["provider"], "SEC EDGAR")
+        self.assertEqual(ctx["ticker"], "META")
+        self.assertEqual(ctx["company_name"], "Meta Platforms, Inc.")
+        self.assertEqual(ctx["coverage"].get("valuation"), "ok")
+        self.assertEqual(ctx["coverage"].get("growth"), "ok")
+        self.assertEqual(ctx["coverage"].get("earnings"), "ok")
+        self.assertEqual(ctx["coverage"].get("institution"), "not_supported")
+        self.assertEqual(ctx["valuation"]["data"]["price"], 614.23)
+        self.assertEqual(
+            ctx["earnings"]["data"]["financial_report"]["additional_metrics"]["gross_profit"]["source_tag"],
+            "GrossProfit",
+        )
+        self.assertEqual(ctx["earnings"]["data"]["filing_references"][0]["form"], "10-Q")
 
     def test_etf_market_downgrades_to_partial_or_not_supported(self) -> None:
         manager = DataFetcherManager(fetchers=[])

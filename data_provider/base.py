@@ -2148,6 +2148,185 @@ class DataFetcherManager:
             **blocks,
         }
 
+    def _get_us_fundamental_context(self, stock_code: str) -> Dict[str, Any]:
+        """Build a fail-open US fundamental context from SEC EDGAR and quotes."""
+        from src.config import get_config
+        from data_provider.sec_edgar import SecEdgarClient
+
+        config = get_config()
+        ticker = normalize_stock_code(stock_code)
+        start_ts = time.time()
+
+        sec_timeout = float(getattr(config, "sec_edgar_timeout_seconds", 15.0) or 15.0)
+        sec_payload, sec_err_msg, sec_ms = self._run_with_retry(
+            lambda: SecEdgarClient(
+                user_agent=getattr(config, "sec_edgar_user_agent", None),
+                timeout=sec_timeout,
+            ).get_company_context(ticker),
+            sec_timeout,
+            "sec_edgar",
+        )
+        if not isinstance(sec_payload, dict):
+            return self._build_market_not_supported(
+                market="us",
+                reason=sec_err_msg or "SEC EDGAR unavailable",
+            )
+
+        fetch_timeout = max(
+            0.0,
+            float(getattr(config, "fundamental_fetch_timeout_seconds", 3.0) or 3.0),
+        )
+        if fetch_timeout > 0:
+            quote_payload, quote_err_msg, quote_ms = self._run_with_retry(
+                lambda: self.get_realtime_quote(ticker, log_final_failure=False),
+                fetch_timeout,
+                "us_realtime_quote",
+            )
+        else:
+            quote_payload, quote_err_msg, quote_ms = None, "fundamental fetch timeout", 0
+
+        quote_dict = {}
+        if quote_payload:
+            source_value = getattr(quote_payload, "source", None)
+            quote_dict = {
+                "price": getattr(quote_payload, "price", None),
+                "change_pct": getattr(quote_payload, "change_pct", None),
+                "pe_ratio": getattr(quote_payload, "pe_ratio", None),
+                "pb_ratio": getattr(quote_payload, "pb_ratio", None),
+                "total_mv": getattr(quote_payload, "total_mv", None),
+                "circ_mv": getattr(quote_payload, "circ_mv", None),
+                "name": getattr(quote_payload, "name", None),
+                "source": getattr(source_value, "value", source_value),
+            }
+
+        valuation_payload = {
+            "price": quote_dict.get("price"),
+            "change_pct": quote_dict.get("change_pct"),
+            "pe_ratio": quote_dict.get("pe_ratio"),
+            "pb_ratio": quote_dict.get("pb_ratio"),
+            "total_mv": quote_dict.get("total_mv"),
+            "circ_mv": quote_dict.get("circ_mv"),
+        }
+        valuation_status = self._infer_block_status(
+            valuation_payload,
+            "partial" if quote_payload is not None else "not_supported",
+        )
+        if valuation_status == "partial" and quote_err_msg and not self._has_meaningful_payload(valuation_payload):
+            valuation_status = "failed"
+
+        financial_report = sec_payload.get("financial_report")
+        if not isinstance(financial_report, dict):
+            financial_report = {}
+        filing_references = sec_payload.get("filing_references")
+        if not isinstance(filing_references, list):
+            filing_references = []
+        insider_filings = sec_payload.get("recent_insider_filings")
+        if not isinstance(insider_filings, list):
+            insider_filings = []
+
+        has_financial_report = self._has_meaningful_payload(financial_report)
+        sec_status = "ok" if has_financial_report else "partial"
+        sec_chain = self._normalize_source_chain(
+            sec_payload.get("source_chain", []),
+            "sec_edgar",
+            sec_status,
+            sec_ms,
+        )
+        quote_chain = self._normalize_source_chain(
+            [{"provider": "realtime_quote", "result": valuation_status, "duration_ms": quote_ms}],
+            "realtime_quote",
+            valuation_status,
+            quote_ms,
+        )
+
+        earnings_payload: Dict[str, Any] = {
+            "financial_report": financial_report,
+            "filing_references": filing_references,
+            "latest_filing": sec_payload.get("latest_filing"),
+            "latest_quarterly_filings": sec_payload.get("latest_quarterly_filings", []),
+            "latest_annual_filing": sec_payload.get("latest_annual_filing"),
+            "recent_insider_filings": insider_filings,
+        }
+        dividend_payload = sec_payload.get("dividend")
+        if isinstance(dividend_payload, dict) and self._has_meaningful_payload(dividend_payload):
+            earnings_payload["dividend"] = dividend_payload
+
+        blocks = {
+            "valuation": self._build_fundamental_block(
+                valuation_status,
+                valuation_payload,
+                quote_chain,
+                [quote_err_msg] if quote_err_msg else [],
+            ),
+            "growth": self._build_fundamental_block(
+                sec_status,
+                {"financial_report": financial_report, "source": "SEC EDGAR companyfacts"},
+                sec_chain,
+                [] if has_financial_report else ["SEC companyfacts financial trend unavailable"],
+            ),
+            "earnings": self._build_fundamental_block(
+                sec_status,
+                earnings_payload,
+                sec_chain,
+                [] if has_financial_report else ["SEC financial statement trend unavailable"],
+            ),
+            "institution": self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "sec_edgar", "result": "not_supported", "duration_ms": 0}],
+                ["US institution block not implemented"],
+            ),
+            "capital_flow": self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "sec_edgar", "result": "not_supported", "duration_ms": 0}],
+                ["US capital flow block not implemented"],
+            ),
+            "dragon_tiger": self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "sec_edgar", "result": "not_supported", "duration_ms": 0}],
+                ["dragon tiger data is CN-only"],
+            ),
+            "boards": self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "sec_edgar", "result": "not_supported", "duration_ms": 0}],
+                ["US board membership block not implemented"],
+            ),
+        }
+        coverage = {block: blocks[block]["status"] for block in blocks}
+        if all(value == "not_supported" for value in coverage.values()):
+            status = "not_supported"
+        elif "failed" in coverage.values() or "partial" in coverage.values() or "not_supported" in coverage.values():
+            status = "partial"
+        else:
+            status = "ok"
+
+        source_chain: List[Dict[str, Any]] = []
+        errors: List[str] = []
+        for block in blocks.values():
+            source_chain.extend(block.get("source_chain", []))
+            errors.extend(block.get("errors", []))
+        if sec_err_msg:
+            errors.append(sec_err_msg)
+
+        return {
+            "market": "us",
+            "status": status,
+            "provider": "SEC EDGAR",
+            "ticker": ticker,
+            "cik": sec_payload.get("cik"),
+            "company_name": sec_payload.get("company_name"),
+            "sec_edgar": sec_payload,
+            "quote": quote_dict,
+            "coverage": coverage,
+            "source_chain": source_chain,
+            "errors": errors,
+            "elapsed_ms": int((time.time() - start_ts) * 1000),
+            **blocks,
+        }
+
     def get_fundamental_context(
         self,
         stock_code: str,
@@ -2168,7 +2347,14 @@ class DataFetcherManager:
         stock_code = normalize_stock_code(stock_code)
         market = _market_tag(stock_code)
         is_etf = _is_etf_code(stock_code)
-        if market in {"us", "hk"}:
+        if market == "us":
+            if getattr(config, "sec_edgar_enabled", False):
+                return self._get_us_fundamental_context(stock_code)
+            return self._build_market_not_supported(
+                market=market,
+                reason="SEC EDGAR disabled",
+            )
+        if market == "hk":
             return self._build_market_not_supported(
                 market=market,
                 reason="market not supported",

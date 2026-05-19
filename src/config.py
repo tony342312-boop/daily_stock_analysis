@@ -823,6 +823,11 @@ class Config:
     # 基本面缓存最大条目数（避免长时间运行内存增长）
     fundamental_cache_max_entries: int = 256
 
+    # === SEC EDGAR (US stocks only) ===
+    sec_edgar_enabled: bool = True
+    sec_edgar_user_agent: str = "daily_stock_analysis/1.0 admin@stock.cn.mt"
+    sec_edgar_timeout_seconds: float = 15.0
+
     # === Portfolio PR2: import/risk/fx settings ===
     portfolio_risk_concentration_alert_pct: float = 35.0
     portfolio_risk_drawdown_alert_pct: float = 15.0
@@ -1616,6 +1621,17 @@ class Config:
                 256,
                 field_name='FUNDAMENTAL_CACHE_MAX_ENTRIES',
                 minimum=1,
+            ),
+            sec_edgar_enabled=os.getenv('SEC_EDGAR_ENABLED', 'true').lower() == 'true',
+            sec_edgar_user_agent=os.getenv(
+                'SEC_EDGAR_USER_AGENT',
+                'daily_stock_analysis/1.0 admin@stock.cn.mt',
+            ),
+            sec_edgar_timeout_seconds=parse_env_float(
+                os.getenv('SEC_EDGAR_TIMEOUT_SECONDS'),
+                15.0,
+                field_name='SEC_EDGAR_TIMEOUT_SECONDS',
+                minimum=1.0,
             ),
             portfolio_risk_concentration_alert_pct=parse_env_float(
                 os.getenv('PORTFOLIO_RISK_CONCENTRATION_ALERT_PCT'),
