@@ -73,4 +73,27 @@ describe('ReportDetails', () => {
     const { container } = render(<ReportDetails />);
     expect(container).toBeEmptyDOMElement();
   });
+
+  it('renders SEC extended financial fields when available', () => {
+    render(
+      <ReportDetails
+        details={{
+          financialReport: {
+            gross_profit: '$18.00B',
+            operating_income: '$12.00B',
+            current_ratio: 1.42,
+            net_interest_income: '$4.20B',
+            stock_repurchases: '$3.00B',
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByText('SEC 扩展字段')).toBeInTheDocument();
+    expect(screen.getByText('利润表扩展')).toBeInTheDocument();
+    expect(screen.getByText('营业利润')).toBeInTheDocument();
+    expect(screen.getByText('$12.00B')).toBeInTheDocument();
+    expect(screen.getByText('流动比率')).toBeInTheDocument();
+    expect(screen.getByText('1.42')).toBeInTheDocument();
+  });
 });

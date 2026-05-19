@@ -11,6 +11,106 @@ interface ReportDetailsProps {
   language?: ReportLanguage;
 }
 
+type UnknownRecord = Record<string, unknown>;
+
+const isRecord = (value: unknown): value is UnknownRecord => (
+  typeof value === 'object' && value !== null && !Array.isArray(value)
+);
+
+const pickValue = (record: UnknownRecord | undefined, ...keys: string[]): unknown => {
+  if (!record) return undefined;
+  for (const key of keys) {
+    const value = record[key];
+    if (value !== undefined && value !== null && value !== '') {
+      return value;
+    }
+  }
+  return undefined;
+};
+
+const displayValue = (value?: unknown, fallback = 'N/A'): string => {
+  if (value === undefined || value === null || value === '') return fallback;
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? String(value) : fallback;
+  }
+  return String(value);
+};
+
+const hasDisplayableValue = (value: unknown): boolean => {
+  if (value === undefined || value === null || value === '') return false;
+  if (typeof value === 'string' && value.trim().toUpperCase() === 'N/A') return false;
+  return true;
+};
+
+const getFinancialExtraSections = (financialReport: UnknownRecord | undefined): Array<{
+  title: string;
+  items: Array<[string, unknown]>;
+}> => {
+  if (!financialReport) return [];
+  const sectionDefs: Array<{
+    title: string;
+    items: Array<[string, unknown]>;
+  }> = [
+    {
+      title: '利润表扩展',
+      items: [
+        ['毛利', pickValue(financialReport, 'grossProfit', 'gross_profit')],
+        ['毛利率', pickValue(financialReport, 'grossMarginPct', 'gross_margin_pct')],
+        ['营业利润', pickValue(financialReport, 'operatingIncome', 'operating_income')],
+        ['营业利润率', pickValue(financialReport, 'operatingMarginPct', 'operating_margin_pct')],
+        ['税前利润', pickValue(financialReport, 'pretaxIncome', 'pretax_income')],
+        ['税前利润率', pickValue(financialReport, 'pretaxMarginPct', 'pretax_margin_pct')],
+        ['所得税', pickValue(financialReport, 'incomeTaxExpense', 'income_tax_expense')],
+        ['基本 EPS', pickValue(financialReport, 'epsBasic', 'eps_basic')],
+      ],
+    },
+    {
+      title: '费用与金融股口径',
+      items: [
+        ['营业成本', pickValue(financialReport, 'costOfRevenue', 'cost_of_revenue')],
+        ['研发费用', pickValue(financialReport, 'researchAndDevelopment', 'research_and_development')],
+        ['销售管理费用', pickValue(financialReport, 'sellingGeneralAdmin', 'selling_general_admin')],
+        ['利息收入', pickValue(financialReport, 'interestIncome', 'interest_income')],
+        ['利息支出', pickValue(financialReport, 'interestExpense', 'interest_expense')],
+        ['净利息收入', pickValue(financialReport, 'netInterestIncome', 'net_interest_income')],
+        ['信用损失准备', pickValue(financialReport, 'provisionForCreditLosses', 'provision_for_credit_losses')],
+      ],
+    },
+    {
+      title: '资产负债补充',
+      items: [
+        ['流动资产', pickValue(financialReport, 'currentAssets', 'current_assets')],
+        ['流动负债', pickValue(financialReport, 'currentLiabilities', 'current_liabilities')],
+        ['流动比率', pickValue(financialReport, 'currentRatio', 'current_ratio')],
+        ['应收账款', pickValue(financialReport, 'accountsReceivable', 'accounts_receivable')],
+        ['存货', pickValue(financialReport, 'inventory')],
+        ['应付账款', pickValue(financialReport, 'accountsPayable', 'accounts_payable')],
+        ['短期借款', pickValue(financialReport, 'shortTermBorrowings', 'short_term_borrowings')],
+        ['总债务', pickValue(financialReport, 'totalDebt', 'total_debt')],
+        ['总债务/资产', pickValue(financialReport, 'totalDebtToAssetsPct', 'total_debt_to_assets_pct')],
+        ['净现金', pickValue(financialReport, 'netCash', 'net_cash')],
+      ],
+    },
+    {
+      title: '现金流补充',
+      items: [
+        ['折旧摊销', pickValue(financialReport, 'depreciationAmortization', 'depreciation_amortization')],
+        ['股权激励', pickValue(financialReport, 'shareBasedCompensation', 'share_based_compensation')],
+        ['分红支付', pickValue(financialReport, 'dividendsPaid', 'dividends_paid')],
+        ['股票回购', pickValue(financialReport, 'stockRepurchases', 'stock_repurchases')],
+        ['摊薄股数', pickValue(financialReport, 'dilutedShares', 'diluted_shares')],
+      ],
+    },
+  ];
+
+  return sectionDefs
+    .map((section) => ({
+      ...section,
+      items: section.items.filter(([, value]) => hasDisplayableValue(value)),
+    }))
+    .filter((section) => section.items.length > 0);
+};
+
 /**
  * 透明度与追溯区组件 - 终端风格
  */
@@ -31,6 +131,8 @@ export const ReportDetails: React.FC<ReportDetailsProps> = ({
     snapshot: false,
   });
   const copyResetTimerRef = useRef<Partial<Record<JsonPanel, number>>>({});
+  const financialReport = isRecord(details?.financialReport) ? details?.financialReport : undefined;
+  const financialExtraSections = getFinancialExtraSections(financialReport);
 
   useEffect(() => {
     return () => {
@@ -43,7 +145,7 @@ export const ReportDetails: React.FC<ReportDetailsProps> = ({
     };
   }, []);
 
-  if (!details?.rawResult && !details?.contextSnapshot && !recordId) {
+  if (!details?.rawResult && !details?.contextSnapshot && !recordId && financialExtraSections.length === 0) {
     return null;
   }
 
@@ -111,6 +213,26 @@ export const ReportDetails: React.FC<ReportDetailsProps> = ({
 
       {/* 折叠区域 */}
       <div className="space-y-2">
+        {financialExtraSections.length > 0 && (
+          <div className="home-subpanel rounded-lg px-3 py-3">
+            <div className="mb-2 text-xs font-medium text-foreground">SEC 扩展字段</div>
+            <div className="grid gap-2 lg:grid-cols-2">
+              {financialExtraSections.map((section) => (
+                <div key={section.title} className="rounded-md border border-subtle px-3 py-2">
+                  <div className="mb-2 text-[11px] font-medium text-muted-text">{section.title}</div>
+                  <div className="space-y-1.5 text-xs">
+                    {section.items.map(([label, value]) => (
+                      <div key={`${section.title}-${label}`} className="flex items-center justify-between gap-3">
+                        <span className="text-muted-text">{label}</span>
+                        <span className="text-right text-foreground">{displayValue(value)}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
         {/* 原始分析结果 */}
         {details?.rawResult && (
           <div>
