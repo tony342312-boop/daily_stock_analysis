@@ -2386,6 +2386,66 @@ class DataFetcherManager:
             **blocks,
         }
 
+    def _get_peer_valuation_context_for_market(
+        self,
+        stock_code: str,
+        market: str,
+        config: Any,
+        budget_seconds: Optional[float] = None,
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[str]]:
+        """Fetch same-type peer PE/PB comparison for a market."""
+        if not getattr(config, "peer_valuation_enabled", True):
+            return {}, [{"provider": "peer_valuation", "result": "disabled", "duration_ms": 0}], []
+
+        from data_provider.peer_valuation import PeerValuationClient, parse_peer_map
+
+        map_attr = {
+            "us": "us_peer_valuation_map",
+            "cn": "cn_peer_valuation_map",
+            "hk": "hk_peer_valuation_map",
+        }.get(market, "us_peer_valuation_map")
+        peer_map = parse_peer_map(getattr(config, map_attr, ""))
+        timeout = float(getattr(config, "peer_valuation_timeout_seconds", 10.0) or 10.0)
+        if budget_seconds is not None:
+            timeout = min(timeout, max(0.0, float(budget_seconds)))
+        provider = f"{market}_peer_valuation"
+        if timeout <= 0:
+            return (
+                {},
+                [{"provider": provider, "result": "skipped", "duration_ms": 0}],
+                ["peer valuation skipped because the fundamental budget is exhausted"],
+            )
+
+        client = PeerValuationClient(
+            quote_fetcher=lambda symbol: self.get_realtime_quote(symbol, log_final_failure=False),
+            peer_map=peer_map,
+            max_peers=getattr(config, "peer_valuation_max_peers", 5),
+            market=market,
+        )
+        payload, err_msg, elapsed_ms = self._run_with_retry(
+            lambda: client.get_peer_valuation_context(stock_code),
+            timeout,
+            "peer_valuation_context",
+        )
+        if not isinstance(payload, dict):
+            reason = err_msg or "peer valuation unavailable"
+            return (
+                {},
+                [{"provider": provider, "result": "failed", "duration_ms": elapsed_ms}],
+                [reason],
+            )
+        chain = self._normalize_source_chain(
+            payload.get("source_chain", []),
+            provider,
+            str(payload.get("status", "partial")),
+            elapsed_ms,
+        )
+        payload_errors = payload.get("errors", [])
+        errors = list(payload_errors) if isinstance(payload_errors, list) else []
+        if err_msg:
+            errors.append(err_msg)
+        return payload, chain, errors
+
     def _get_us_fundamental_context(self, stock_code: str) -> Dict[str, Any]:
         """Build a fail-open US fundamental context from SEC EDGAR and quotes."""
         from src.config import get_config
@@ -2554,7 +2614,13 @@ class DataFetcherManager:
                 ["US board membership block not implemented"],
             ),
         }
+        peer_payload, peer_chain, peer_errors = self._get_peer_valuation_context_for_market(
+            ticker,
+            "us",
+            config,
+        )
         coverage = {block: blocks[block]["status"] for block in blocks}
+        coverage["peer_valuation"] = str(peer_payload.get("status", "not_configured")) if peer_payload else "not_configured"
         if all(value == "not_supported" for value in coverage.values()):
             status = "not_supported"
         elif "failed" in coverage.values() or "partial" in coverage.values() or "not_supported" in coverage.values():
@@ -2567,6 +2633,8 @@ class DataFetcherManager:
         for block in blocks.values():
             source_chain.extend(block.get("source_chain", []))
             errors.extend(block.get("errors", []))
+        source_chain.extend(peer_chain)
+        errors.extend(peer_errors)
         if sec_err_msg:
             errors.append(sec_err_msg)
 
@@ -2579,6 +2647,7 @@ class DataFetcherManager:
             "company_name": sec_payload.get("company_name"),
             "sec_edgar": sec_payload,
             "quote": quote_dict,
+            "peer_valuation": peer_payload,
             "coverage": coverage,
             "source_chain": source_chain,
             "errors": errors,

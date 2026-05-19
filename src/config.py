@@ -833,6 +833,14 @@ class Config:
     sec_edgar_user_agent: str = "daily_stock_analysis/1.0 admin@stock.cn.mt"
     sec_edgar_timeout_seconds: float = 15.0
 
+    # === Peer valuation context ===
+    peer_valuation_enabled: bool = True
+    peer_valuation_timeout_seconds: float = 10.0
+    peer_valuation_max_peers: int = 5
+    us_peer_valuation_map: str = ""
+    cn_peer_valuation_map: str = ""
+    hk_peer_valuation_map: str = ""
+
     # === Portfolio PR2: import/risk/fx settings ===
     portfolio_risk_concentration_alert_pct: float = 35.0
     portfolio_risk_drawdown_alert_pct: float = 15.0
@@ -1643,6 +1651,22 @@ class Config:
                 field_name='SEC_EDGAR_TIMEOUT_SECONDS',
                 minimum=1.0,
             ),
+            peer_valuation_enabled=os.getenv('PEER_VALUATION_ENABLED', 'true').lower() == 'true',
+            peer_valuation_timeout_seconds=parse_env_float(
+                os.getenv('PEER_VALUATION_TIMEOUT_SECONDS'),
+                10.0,
+                field_name='PEER_VALUATION_TIMEOUT_SECONDS',
+                minimum=1.0,
+            ),
+            peer_valuation_max_peers=parse_env_int(
+                os.getenv('PEER_VALUATION_MAX_PEERS'),
+                5,
+                field_name='PEER_VALUATION_MAX_PEERS',
+                minimum=1,
+            ),
+            us_peer_valuation_map=os.getenv('US_PEER_VALUATION_MAP', ''),
+            cn_peer_valuation_map=os.getenv('CN_PEER_VALUATION_MAP', ''),
+            hk_peer_valuation_map=os.getenv('HK_PEER_VALUATION_MAP', ''),
             portfolio_risk_concentration_alert_pct=parse_env_float(
                 os.getenv('PORTFOLIO_RISK_CONCENTRATION_ALERT_PCT'),
                 35.0,
