@@ -13,6 +13,7 @@ interface HistoryListProps {
   selectedId?: number;  // 当前选中的历史记录 ID
   selectedIds: Set<number>;
   isDeleting?: boolean;
+  isAdminView?: boolean;
   onItemClick: (recordId: number) => void;  // 点击记录的回调
   onLoadMore: () => void;
   onToggleItemSelection: (recordId: number) => void;
@@ -33,6 +34,7 @@ export const HistoryList: React.FC<HistoryListProps> = ({
   selectedId,
   selectedIds,
   isDeleting = false,
+  isAdminView = false,
   onItemClick,
   onLoadMore,
   onToggleItemSelection,
@@ -94,7 +96,7 @@ export const HistoryList: React.FC<HistoryListProps> = ({
         <div className="mb-4 space-y-3">
           <DashboardPanelHeader
             className="mb-1"
-            title="历史分析"
+            title={isAdminView ? '全部用户查询记录' : '历史分析'}
             titleClassName="text-sm font-medium"
             leading={(
               <svg className="h-4 w-4 text-primary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -168,6 +170,7 @@ export const HistoryList: React.FC<HistoryListProps> = ({
                 isViewing={selectedId === item.id}
                 isChecked={selectedIds.has(item.id)}
                 isDeleting={isDeleting}
+                showUser={isAdminView}
                 onToggleChecked={onToggleItemSelection}
                 onClick={onItemClick}
               />

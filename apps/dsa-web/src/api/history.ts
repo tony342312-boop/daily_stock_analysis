@@ -22,23 +22,27 @@ export const historyApi = {
    * @param params 筛选和分页参数
    */
   getList: async (params: GetHistoryListParams = {}): Promise<HistoryListResponse> => {
-    const { stockCode, startDate, endDate, page = 1, limit = 20 } = params;
+    const { stockCode, startDate, endDate, allUsers, userId, page = 1, limit = 20 } = params;
 
-    const queryParams: Record<string, string | number> = { page, limit };
+    const queryParams: Record<string, string | number | boolean> = { page, limit };
     if (stockCode) queryParams.stock_code = stockCode;
     if (startDate) queryParams.start_date = startDate;
     if (endDate) queryParams.end_date = endDate;
+    if (allUsers) queryParams.allUsers = true;
+    if (userId !== undefined) queryParams.user_id = userId;
 
     const response = await apiClient.get<Record<string, unknown>>('/api/v1/history', {
       params: queryParams,
     });
 
-    const data = toCamelCase<{ total: number; page: number; limit: number; items: HistoryItem[] }>(response.data);
+    const data = toCamelCase<HistoryListResponse>(response.data);
     return {
       total: data.total,
       page: data.page,
       limit: data.limit,
       items: data.items.map(item => toCamelCase<HistoryItem>(item)),
+      retentionDays: data.retentionDays,
+      autoCleanupEnabled: data.autoCleanupEnabled,
     };
   },
 

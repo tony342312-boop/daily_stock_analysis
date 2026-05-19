@@ -10,6 +10,7 @@ interface HistoryListItemProps {
   isViewing: boolean; // Indicates if this report is currently being viewed in the right panel
   isChecked: boolean; // Indicates if the checkbox is checked for bulk operations
   isDeleting: boolean;
+  showUser?: boolean;
   onToggleChecked: (recordId: number) => void;
   onClick: (recordId: number) => void;
 }
@@ -39,6 +40,7 @@ export const HistoryListItem: React.FC<HistoryListItemProps> = ({
   isViewing,
   isChecked,
   isDeleting,
+  showUser = false,
   onToggleChecked,
   onClick,
 }) => {
@@ -105,6 +107,14 @@ export const HistoryListItem: React.FC<HistoryListItemProps> = ({
               <span className="text-[11px] text-secondary-text font-mono">
                 {item.stockCode}
               </span>
+              {showUser && (item.username || item.userId !== undefined) && (
+                <>
+                  <span className="w-1 h-1 rounded-full bg-subtle-hover" />
+                  <span className="text-[11px] text-primary">
+                    用户：{item.username || `#${item.userId}`}
+                  </span>
+                </>
+              )}
               <span className="w-1 h-1 rounded-full bg-subtle-hover" />
               <span className="text-[11px] text-muted-text">
                 {formatDateTime(item.createdAt)}

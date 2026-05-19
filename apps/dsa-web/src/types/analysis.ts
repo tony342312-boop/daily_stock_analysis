@@ -215,6 +215,8 @@ export interface HistoryItem {
   sentimentScore?: number;
   operationAdvice?: string;
   createdAt: string;
+  userId?: number;
+  username?: string;
 }
 
 /** History list response */
@@ -223,6 +225,8 @@ export interface HistoryListResponse {
   page: number;
   limit: number;
   items: HistoryItem[];
+  retentionDays?: number;
+  autoCleanupEnabled?: boolean;
 }
 
 /** News item */
@@ -243,6 +247,8 @@ export interface HistoryFilters {
   stockCode?: string;
   startDate?: string;
   endDate?: string;
+  allUsers?: boolean;
+  userId?: number;
 }
 
 /** History pagination parameters */

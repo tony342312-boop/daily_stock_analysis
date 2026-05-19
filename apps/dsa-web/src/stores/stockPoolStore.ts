@@ -47,6 +47,7 @@ export interface StockPoolState {
   isLoadingMore: boolean;
   hasMore: boolean;
   currentPage: number;
+  historyAllUsers: boolean;
   selectedReport: AnalysisReport | null;
   isLoadingReport: boolean;
   activeTasks: TaskInfo[];
@@ -56,6 +57,7 @@ export interface StockPoolState {
   clearInlineMessages: () => void;
   openMarkdownDrawer: () => void;
   closeMarkdownDrawer: () => void;
+  setHistoryAllUsers: (enabled: boolean) => void;
   loadInitialHistory: () => Promise<void>;
   refreshHistory: (silent?: boolean) => Promise<void>;
   loadMoreHistory: () => Promise<void>;
@@ -87,16 +89,18 @@ const initialState = {
   isLoadingMore: false,
   hasMore: true,
   currentPage: 1,
+  historyAllUsers: false,
   selectedReport: null as AnalysisReport | null,
   isLoadingReport: false,
   activeTasks: [] as TaskInfo[],
   markdownDrawerOpen: false,
 };
 
-function buildHistoryParams(page: number) {
+function buildHistoryParams(page: number, allUsers: boolean) {
   return {
     startDate: getRecentStartDate(30),
     endDate: getTodayInShanghai(),
+    allUsers,
     page,
     limit: PAGE_SIZE,
   };
@@ -121,7 +125,7 @@ async function fetchHistory(
   }
 
   try {
-    const response = await historyApi.getList(buildHistoryParams(page));
+    const response = await historyApi.getList(buildHistoryParams(page, get().historyAllUsers));
     if (requestId !== historyRequestSeq) {
       return null;
     }
@@ -196,6 +200,21 @@ export const useStockPoolStore = create<StockPoolState>((set, get) => ({
   openMarkdownDrawer: () => set({ markdownDrawerOpen: true }),
 
   closeMarkdownDrawer: () => set({ markdownDrawerOpen: false }),
+
+  setHistoryAllUsers: (enabled) => {
+    if (get().historyAllUsers === enabled) {
+      return;
+    }
+    set({
+      historyAllUsers: enabled,
+      historyItems: [],
+      selectedHistoryIds: [],
+      selectedReport: null,
+      currentPage: 1,
+      hasMore: true,
+    });
+    void get().loadInitialHistory();
+  },
 
   loadInitialHistory: async () => {
     await fetchHistory(get, set, { autoSelectFirst: true, reset: true });

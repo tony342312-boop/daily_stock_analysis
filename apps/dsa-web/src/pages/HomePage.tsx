@@ -13,6 +13,7 @@ import { HistoryList } from '../components/history';
 import { ReportMarkdown, ReportSummary } from '../components/report';
 import { TaskPanel } from '../components/tasks';
 import { useDashboardLifecycle, useHomeDashboardState } from '../hooks';
+import { useAuth } from '../contexts/AuthContext';
 import type { SetupStatusResponse } from '../types/systemConfig';
 import { getReportText, normalizeReportLanguage } from '../utils/reportLanguage';
 
@@ -24,6 +25,8 @@ type MarketReviewNotice = {
 
 const HomePage: React.FC = () => {
   const navigate = useNavigate();
+  const { currentUser } = useAuth();
+  const isAdminHistoryView = currentUser?.role === 'admin';
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [isSubmittingMarketReview, setIsSubmittingMarketReview] = useState(false);
@@ -512,6 +515,7 @@ const HomePage: React.FC = () => {
           selectedId={selectedReport?.meta.id}
           selectedIds={selectedIds}
           isDeleting={isDeletingHistory}
+          isAdminView={isAdminHistoryView}
           onItemClick={handleHistoryItemClick}
           onLoadMore={() => void loadMoreHistory()}
           onToggleItemSelection={toggleHistorySelection}
@@ -525,6 +529,7 @@ const HomePage: React.FC = () => {
       activeTasks,
       hasMore,
       historyItems,
+      isAdminHistoryView,
       isDeletingHistory,
       isLoadingHistory,
       isLoadingMore,

@@ -1,11 +1,20 @@
 import apiClient from './index';
 
+export type AuthUser = {
+  id?: number | null;
+  username: string;
+  role: 'admin' | 'user' | string;
+};
+
 export type AuthStatusResponse = {
   authEnabled: boolean;
   loggedIn: boolean;
   passwordSet?: boolean;
   passwordChangeable?: boolean;
   setupState: 'enabled' | 'password_retained' | 'no_password';
+  currentUser?: AuthUser | null;
+  registrationEnabled?: boolean;
+  registrationInviteRequired?: boolean;
 };
 
 export const authApi = {
@@ -39,10 +48,13 @@ export const authApi = {
     return data;
   },
 
-  async login(password: string, passwordConfirm?: string): Promise<void> {
-    const body: { password: string; passwordConfirm?: string } = { password };
+  async login(password: string, passwordConfirm?: string, username?: string): Promise<void> {
+    const body: { password: string; passwordConfirm?: string; username?: string } = { password };
     if (passwordConfirm !== undefined) {
       body.passwordConfirm = passwordConfirm;
+    }
+    if (username !== undefined && username.trim()) {
+      body.username = username.trim();
     }
     await apiClient.post('/api/v1/auth/login', body);
   },
