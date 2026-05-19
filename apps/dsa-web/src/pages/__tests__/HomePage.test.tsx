@@ -3,6 +3,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { analysisApi, DuplicateTaskError } from '../../api/analysis';
 import { agentApi } from '../../api/agent';
+import { feedbackApi } from '../../api/feedback';
 import { historyApi } from '../../api/history';
 import { systemConfigApi } from '../../api/systemConfig';
 import { useStockPoolStore } from '../../stores';
@@ -51,6 +52,18 @@ vi.mock('../../api/agent', () => ({
   agentApi: {
     getSkills: vi.fn(),
   },
+}));
+
+vi.mock('../../api/feedback', () => ({
+  feedbackApi: {
+    submit: vi.fn(),
+  },
+}));
+
+vi.mock('../../contexts/AuthContext', () => ({
+  useAuth: () => ({
+    currentUser: null,
+  }),
 }));
 
 vi.mock('../../hooks/useTaskStream', () => ({
@@ -118,6 +131,7 @@ describe('HomePage', () => {
     navigateMock.mockReset();
     useStockPoolStore.getState().resetDashboardState();
     vi.mocked(agentApi.getSkills).mockResolvedValue({ skills: [], default_skill_id: '' });
+    vi.mocked(feedbackApi.submit).mockResolvedValue({ ok: true, notificationSent: true });
     vi.mocked(systemConfigApi.getSetupStatus).mockResolvedValue({
       isComplete: true,
       readyForSmoke: true,
@@ -637,5 +651,34 @@ describe('HomePage', () => {
 
     expect(analysisApi.analyzeAsync).not.toHaveBeenCalled();
     expect(navigateMock).not.toHaveBeenCalled();
+  });
+
+  it('submits feedback from the home toolbar', async () => {
+    vi.mocked(historyApi.getList).mockResolvedValue({
+      total: 0,
+      page: 1,
+      limit: 20,
+      items: [],
+    });
+
+    render(
+      <MemoryRouter>
+        <HomePage />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '反馈问题' }));
+    fireEvent.change(screen.getByLabelText('问题描述'), {
+      target: { value: 'META 财报表格缺少收入字段' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '提交反馈' }));
+
+    await waitFor(() => {
+      expect(feedbackApi.submit).toHaveBeenCalledWith(expect.objectContaining({
+        category: 'bug',
+        content: 'META 财报表格缺少收入字段',
+      }));
+    });
+    expect(await screen.findByText('已接收，反馈已提交。')).toBeInTheDocument();
   });
 });

@@ -4,6 +4,7 @@ import { BarChart3, Check, SlidersHorizontal } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { getParsedApiError, type ParsedApiError } from '../api/error';
 import { analysisApi } from '../api/analysis';
+import { feedbackApi, type FeedbackCategory } from '../api/feedback';
 import { agentApi, type SkillInfo } from '../api/agent';
 import { systemConfigApi } from '../api/systemConfig';
 import { ApiErrorAlert, ConfirmDialog, Button, EmptyState, InlineAlert } from '../components/common';
@@ -37,6 +38,12 @@ const HomePage: React.FC = () => {
   const [analysisSkills, setAnalysisSkills] = useState<SkillInfo[]>([]);
   const [selectedStrategyId, setSelectedStrategyId] = useState('');
   const [strategyMenuOpen, setStrategyMenuOpen] = useState(false);
+  const [feedbackOpen, setFeedbackOpen] = useState(false);
+  const [feedbackCategory, setFeedbackCategory] = useState<FeedbackCategory>('bug');
+  const [feedbackContent, setFeedbackContent] = useState('');
+  const [feedbackContact, setFeedbackContact] = useState('');
+  const [feedbackStatus, setFeedbackStatus] = useState<{ type: 'success' | 'danger'; message: string } | null>(null);
+  const [isSubmittingFeedback, setIsSubmittingFeedback] = useState(false);
   const marketReviewPollTimer = useRef<number | null>(null);
   const dashboardScrollRef = useRef<HTMLElement | null>(null);
   const strategyMenuRef = useRef<HTMLDivElement | null>(null);
@@ -503,6 +510,44 @@ const HomePage: React.FC = () => {
     setShowDeleteConfirm(false);
   }, [deleteSelectedHistory]);
 
+  const handleOpenFeedback = useCallback(() => {
+    setFeedbackStatus(null);
+    setFeedbackOpen(true);
+  }, []);
+
+  const handleCloseFeedback = useCallback(() => {
+    if (isSubmittingFeedback) {
+      return;
+    }
+    setFeedbackOpen(false);
+  }, [isSubmittingFeedback]);
+
+  const handleSubmitFeedback = useCallback(async () => {
+    const content = feedbackContent.trim();
+    if (!content) {
+      setFeedbackStatus({ type: 'danger', message: '请先填写问题描述。' });
+      return;
+    }
+
+    setIsSubmittingFeedback(true);
+    setFeedbackStatus(null);
+    try {
+      await feedbackApi.submit({
+        category: feedbackCategory,
+        content,
+        contact: feedbackContact.trim() || undefined,
+        pageUrl: window.location.href,
+      });
+      setFeedbackContent('');
+      setFeedbackContact('');
+      setFeedbackStatus({ type: 'success', message: '已接收，反馈已提交。' });
+    } catch {
+      setFeedbackStatus({ type: 'danger', message: '反馈提交失败，请稍后重试。' });
+    } finally {
+      setIsSubmittingFeedback(false);
+    }
+  }, [feedbackCategory, feedbackContact, feedbackContent]);
+
   const sidebarContent = useMemo(
     () => (
       <div className="flex min-h-0 h-full flex-col gap-3 overflow-hidden">
@@ -635,6 +680,15 @@ const HomePage: React.FC = () => {
                 />
                 推送通知
               </label>
+              <Button
+                type="button"
+                variant="secondary"
+                size="md"
+                onClick={handleOpenFeedback}
+                className="h-10 flex-1 whitespace-nowrap border-amber-400/40 text-amber-200 md:flex-none"
+              >
+                反馈问题
+              </Button>
               <Button
                 type="button"
                 variant="secondary"
@@ -856,6 +910,86 @@ const HomePage: React.FC = () => {
           reportLanguage={reportLanguage}
           onClose={closeMarkdownDrawer}
         />
+      ) : null}
+
+      {feedbackOpen ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4" role="dialog" aria-modal="true" aria-label="反馈问题">
+          <div className="dashboard-card w-full max-w-lg space-y-4 p-5 shadow-2xl">
+            <div className="flex items-start justify-between gap-3">
+              <h2 className="text-lg font-semibold text-foreground">反馈问题</h2>
+              <button
+                type="button"
+                onClick={handleCloseFeedback}
+                className="rounded-lg px-2 py-1 text-secondary-text hover:bg-hover hover:text-foreground"
+                aria-label="关闭反馈"
+              >
+                关闭
+              </button>
+            </div>
+
+            {feedbackStatus ? (
+              <InlineAlert
+                variant={feedbackStatus.type}
+                title={feedbackStatus.type === 'success' ? '提交成功' : '提交失败'}
+                message={feedbackStatus.message}
+                className="rounded-xl px-3 py-2 text-xs shadow-none"
+              />
+            ) : null}
+
+            <label className="block space-y-1.5 text-sm text-secondary-text">
+              <span>问题类型</span>
+              <select
+                value={feedbackCategory}
+                onChange={(event) => setFeedbackCategory(event.target.value as FeedbackCategory)}
+                className="w-full rounded-xl border border-subtle bg-surface px-3 py-2 text-foreground outline-none focus:border-cyan/60"
+              >
+                <option value="bug">Bug / 功能异常</option>
+                <option value="iteration">迭代建议</option>
+                <option value="other">其他</option>
+              </select>
+            </label>
+
+            <label className="block space-y-1.5 text-sm text-secondary-text">
+              <span>问题描述</span>
+              <textarea
+                aria-label="问题描述"
+                value={feedbackContent}
+                onChange={(event) => setFeedbackContent(event.target.value)}
+                placeholder="请描述你遇到的问题、操作步骤、股票代码或页面现象。"
+                rows={5}
+                maxLength={2000}
+                className="w-full resize-none rounded-xl border border-subtle bg-surface px-3 py-2 text-foreground outline-none focus:border-cyan/60"
+              />
+            </label>
+
+            <label className="block space-y-1.5 text-sm text-secondary-text">
+              <span>联系方式（选填）</span>
+              <input
+                aria-label="联系方式（选填）"
+                value={feedbackContact}
+                onChange={(event) => setFeedbackContact(event.target.value)}
+                placeholder={currentUser?.username ? `当前用户：${currentUser.username}` : '邮箱 / 微信 / 备注'}
+                maxLength={200}
+                className="w-full rounded-xl border border-subtle bg-surface px-3 py-2 text-foreground outline-none focus:border-cyan/60"
+              />
+            </label>
+
+            <div className="flex justify-end gap-2">
+              <Button variant="ghost" size="sm" onClick={handleCloseFeedback} disabled={isSubmittingFeedback}>
+                取消
+              </Button>
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={handleSubmitFeedback}
+                isLoading={isSubmittingFeedback}
+                loadingText="提交中"
+              >
+                提交反馈
+              </Button>
+            </div>
+          </div>
+        </div>
       ) : null}
 
       <ConfirmDialog
