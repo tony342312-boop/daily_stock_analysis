@@ -10,9 +10,10 @@
 """
 
 import logging
+import os
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query, Depends, Body
+from fastapi import APIRouter, HTTPException, Query, Depends, Body, Request
 
 from api.deps import get_database_manager
 from api.v1.schemas.history import (
@@ -61,11 +62,14 @@ router = APIRouter()
     description="分页获取历史分析记录摘要，支持按股票代码和日期范围筛选"
 )
 def get_history_list(
+    request: Request,
     stock_code: Optional[str] = Query(None, description="股票代码筛选"),
     start_date: Optional[str] = Query(None, description="开始日期 (YYYY-MM-DD)"),
     end_date: Optional[str] = Query(None, description="结束日期 (YYYY-MM-DD)"),
     page: int = Query(1, ge=1, description="页码（从 1 开始）"),
     limit: int = Query(20, ge=1, le=100, description="每页数量"),
+    user_id: Optional[int] = Query(None, description="管理员按用户筛选"),
+    all_users: bool = Query(False, alias="allUsers", description="管理员查看全部用户记录"),
     db_manager: DatabaseManager = Depends(get_database_manager)
 ) -> HistoryListResponse:
     """
@@ -86,6 +90,10 @@ def get_history_list(
     """
     try:
         service = HistoryService(db_manager)
+        current_user = getattr(request.state, "current_user", None) or {}
+        is_admin = current_user.get("role") == "admin"
+        effective_user_id = user_id if is_admin and user_id is not None else current_user.get("id")
+        include_all = bool(is_admin and all_users)
         
         # 使用 def 而非 async def，FastAPI 自动在线程池中执行
         result = service.get_history_list(
@@ -93,7 +101,9 @@ def get_history_list(
             start_date=start_date,
             end_date=end_date,
             page=page,
-            limit=limit
+            limit=limit,
+            user_id=effective_user_id,
+            include_all_users=include_all,
         )
         
         # 转换为响应模型
@@ -106,16 +116,30 @@ def get_history_list(
                 report_type=item.get("report_type"),
                 sentiment_score=item.get("sentiment_score"),
                 operation_advice=item.get("operation_advice"),
-                created_at=item.get("created_at")
+                created_at=item.get("created_at"),
+                user_id=item.get("user_id"),
+                username=item.get("username"),
             )
             for item in result.get("items", [])
         ]
         
+        try:
+            retention_days = int(os.getenv("HISTORY_RETENTION_DAYS", "14"))
+        except ValueError:
+            retention_days = 14
+        auto_cleanup_enabled = os.getenv("HISTORY_AUTO_CLEANUP_ENABLED", "true").strip().lower() in {
+            "true",
+            "1",
+            "yes",
+            "on",
+        }
         return HistoryListResponse(
             total=result.get("total", 0),
             page=page,
             limit=limit,
-            items=items
+            items=items,
+            retention_days=retention_days,
+            auto_cleanup_enabled=auto_cleanup_enabled,
         )
         
     except Exception as e:
@@ -187,6 +211,7 @@ def delete_history_records(
 )
 def get_history_detail(
     record_id: str,
+    request: Request,
     db_manager: DatabaseManager = Depends(get_database_manager)
 ) -> AnalysisReport:
     """
@@ -223,6 +248,13 @@ def get_history_detail(
         # 从 context_snapshot 中提取价格信息
         # 注意：使用 `is None` 而非 `or`，避免把 0.0（平盘）误判为缺失值；
         # 同时不混用 `change_60d`（60 日累计涨跌幅）作为日内 change_pct 的兜底。
+        current_user = getattr(request.state, "current_user", None) or {}
+        if current_user and current_user.get("role") != "admin" and result.get("user_id") != current_user.get("id"):
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "not_found", "message": f"未找到 id/query_id={record_id} 的分析记录"},
+            )
+
         current_price = None
         change_pct = None
         context_snapshot = result.get("context_snapshot")
