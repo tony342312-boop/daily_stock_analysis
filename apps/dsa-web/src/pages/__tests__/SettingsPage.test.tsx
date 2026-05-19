@@ -466,19 +466,14 @@ describe('SettingsPage', () => {
     expect(screen.getAllByText('build-20260329-021530Z')).toHaveLength(2);
   });
 
-  it('resets local drafts from the page header button', () => {
+  it('renders settings in read-only mode without save or reset controls', () => {
     useSystemConfigMock.mockReturnValue(buildSystemConfigState({ hasDirty: true, dirtyCount: 2 }));
 
     render(<SettingsPage />);
 
-    // Clear the initial load call from useEffect
-    vi.clearAllMocks();
-
-    fireEvent.click(screen.getByRole('button', { name: '重置' }));
-
-    // Reset should call resetDraft and NOT call load
-    expect(resetDraft).toHaveBeenCalledTimes(1);
-    expect(load).not.toHaveBeenCalled();
+    expect(screen.getByText('只读模式')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '重置' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /保存配置/ })).not.toBeInTheDocument();
   });
 
   it('shows deep research and event monitor fields in the agent category when available', () => {
@@ -552,50 +547,120 @@ describe('SettingsPage', () => {
     expect(screen.getByText('AGENT_EVENT_MONITOR_ENABLED')).toBeInTheDocument();
   });
 
-  it('reset button semantic: discards local changes without network request', () => {
-    // Simulate user has unsaved drafts
-    const dirtyState = buildSystemConfigState({
-      hasDirty: true,
-      dirtyCount: 2,
-    });
-
-    useSystemConfigMock.mockReturnValue(dirtyState);
+  it('does not expose write actions when local drafts exist', () => {
+    useSystemConfigMock.mockReturnValue(buildSystemConfigState({ hasDirty: true, dirtyCount: 2 }));
 
     render(<SettingsPage />);
 
-    // Clear initial useEffect load call
-    vi.clearAllMocks();
-
-    // Click reset button
-    fireEvent.click(screen.getByRole('button', { name: '重置' }));
-
-    // Verify semantic: reset should only discard local changes
-    // It should NOT trigger a network load
-    expect(resetDraft).toHaveBeenCalledTimes(1);
-    expect(load).not.toHaveBeenCalled();
+    expect(screen.getByText('只读模式')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '重置' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /保存配置/ })).not.toBeInTheDocument();
+    expect(resetDraft).not.toHaveBeenCalled();
     expect(save).not.toHaveBeenCalled();
   });
 
-  it('refreshes server state after intelligent import merges stock list', async () => {
+  it('does not expose intelligent import in read-only web settings', () => {
     useSystemConfigMock.mockReturnValue(buildSystemConfigState({ activeCategory: 'base' }));
 
     render(<SettingsPage />);
 
-    fireEvent.click(screen.getByRole('button', { name: 'merge stock list' }));
-
-    expect(refreshAfterExternalSave).toHaveBeenCalledWith(['STOCK_LIST']);
-    expect(load).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('heading', { name: '智能导入' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'merge stock list' })).not.toBeInTheDocument();
+    expect(refreshAfterExternalSave).not.toHaveBeenCalled();
   });
 
-  it('refreshes server state after llm channel editor saves', async () => {
-    useSystemConfigMock.mockReturnValue(buildSystemConfigState({ activeCategory: 'ai_model' }));
+  it('hides API-related settings and the LLM channel editor in web settings', () => {
+    useSystemConfigMock.mockReturnValue(buildSystemConfigState({
+      activeCategory: 'ai_model',
+      itemsByCategory: {
+        ...buildSystemConfigState().itemsByCategory,
+        ai_model: [
+          {
+            key: 'LLM_CHANNELS',
+            value: 'primary',
+            rawValueExists: true,
+            isMasked: false,
+            schema: {
+              key: 'LLM_CHANNELS',
+              category: 'ai_model',
+              dataType: 'string',
+              uiControl: 'textarea',
+              isSensitive: false,
+              isRequired: false,
+              isEditable: true,
+              options: [],
+              validation: {},
+              displayOrder: 1,
+            },
+          },
+          {
+            key: 'LLM_PRIMARY_API_KEY',
+            value: 'sk-secret',
+            rawValueExists: true,
+            isMasked: true,
+            schema: {
+              key: 'LLM_PRIMARY_API_KEY',
+              category: 'ai_model',
+              dataType: 'string',
+              uiControl: 'password',
+              isSensitive: true,
+              isRequired: false,
+              isEditable: true,
+              options: [],
+              validation: {},
+              displayOrder: 2,
+            },
+          },
+          {
+            key: 'LLM_PRIMARY_BASE_URL',
+            value: 'https://api.example.com/v1',
+            rawValueExists: true,
+            isMasked: false,
+            schema: {
+              key: 'LLM_PRIMARY_BASE_URL',
+              category: 'ai_model',
+              dataType: 'string',
+              uiControl: 'text',
+              isSensitive: false,
+              isRequired: false,
+              isEditable: true,
+              options: [],
+              validation: {},
+              displayOrder: 3,
+            },
+          },
+          {
+            key: 'OPENAI_MODEL',
+            value: 'gpt-4o-mini',
+            rawValueExists: true,
+            isMasked: false,
+            schema: {
+              key: 'OPENAI_MODEL',
+              category: 'ai_model',
+              dataType: 'string',
+              uiControl: 'text',
+              isSensitive: false,
+              isRequired: false,
+              isEditable: true,
+              options: [],
+              validation: {},
+              displayOrder: 4,
+            },
+          },
+        ],
+      },
+    }));
 
     render(<SettingsPage />);
 
-    fireEvent.click(screen.getByRole('button', { name: 'save llm channels' }));
-
-    expect(refreshAfterExternalSave).toHaveBeenCalledWith(['LLM_CHANNELS']);
-    expect(load).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('heading', { name: 'AI 模型接入' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'save llm channels' })).not.toBeInTheDocument();
+    expect(screen.queryByText('LLM_CHANNELS')).not.toBeInTheDocument();
+    expect(screen.queryByText('LLM_PRIMARY_API_KEY')).not.toBeInTheDocument();
+    expect(screen.queryByText('LLM_PRIMARY_BASE_URL')).not.toBeInTheDocument();
+    expect(screen.queryByText('OPENAI_MODEL')).not.toBeInTheDocument();
+    expect(screen.queryByDisplayValue('sk-secret')).not.toBeInTheDocument();
+    expect(screen.queryByDisplayValue('https://api.example.com/v1')).not.toBeInTheDocument();
   });
 
   it('does not render desktop env backup card outside desktop runtime', () => {

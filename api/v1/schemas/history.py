@@ -28,6 +28,8 @@ class HistoryItem(BaseModel):
     )
     operation_advice: Optional[str] = Field(None, description="操作建议")
     created_at: Optional[str] = Field(None, description="创建时间")
+    user_id: Optional[int] = Field(None, description="所属用户 ID")
+    username: Optional[str] = Field(None, description="所属用户名")
     
     class Config:
         json_schema_extra = {
@@ -51,6 +53,8 @@ class HistoryListResponse(BaseModel):
     page: int = Field(..., description="当前页码")
     limit: int = Field(..., description="每页数量")
     items: List[HistoryItem] = Field(default_factory=list, description="记录列表")
+    retention_days: int = Field(14, description="历史记录自动保留天数")
+    auto_cleanup_enabled: bool = Field(True, description="是否启用自动清理过期历史")
     
     class Config:
         json_schema_extra = {

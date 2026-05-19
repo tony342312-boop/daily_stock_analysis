@@ -15,6 +15,8 @@ export function useHomeDashboardState() {
       error: state.error,
       isAnalyzing: state.isAnalyzing,
       historyItems: state.historyItems,
+      historyRetentionDays: state.historyRetentionDays,
+      historyAutoCleanupEnabled: state.historyAutoCleanupEnabled,
       selectedHistoryIds: state.selectedHistoryIds,
       isDeletingHistory: state.isDeletingHistory,
       isLoadingHistory: state.isLoadingHistory,

@@ -1,6 +1,8 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { useAuth } from '../contexts/AuthContext';
+import { feedbackApi, type FeedbackCategory } from '../api/feedback';
 import { ApiErrorAlert, ConfirmDialog, Button, EmptyState, InlineAlert } from '../components/common';
 import { DashboardStateBlock } from '../components/dashboard';
 import { StockAutocomplete } from '../components/StockAutocomplete';
@@ -12,8 +14,18 @@ import { getReportText, normalizeReportLanguage } from '../utils/reportLanguage'
 
 const HomePage: React.FC = () => {
   const navigate = useNavigate();
+  const { currentUser } = useAuth();
+  const isAdmin = currentUser?.role === 'admin';
+  const historyScope = useMemo(() => ({ allUsers: isAdmin }), [isAdmin]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [feedbackOpen, setFeedbackOpen] = useState(false);
+  const [feedbackCategory, setFeedbackCategory] = useState<FeedbackCategory>('bug');
+  const [feedbackCategoryOpen, setFeedbackCategoryOpen] = useState(false);
+  const [feedbackContent, setFeedbackContent] = useState('');
+  const [feedbackContact, setFeedbackContact] = useState('');
+  const [feedbackStatus, setFeedbackStatus] = useState<{ type: 'success' | 'warning' | 'danger'; message: string } | null>(null);
+  const [isSubmittingFeedback, setIsSubmittingFeedback] = useState(false);
 
   const {
     query,
@@ -22,6 +34,8 @@ const HomePage: React.FC = () => {
     error,
     isAnalyzing,
     historyItems,
+    historyRetentionDays,
+    historyAutoCleanupEnabled,
     selectedHistoryIds,
     isDeletingHistory,
     isLoadingHistory,
@@ -58,9 +72,12 @@ const HomePage: React.FC = () => {
   const reportLanguage = normalizeReportLanguage(selectedReport?.meta.reportLanguage);
   const reportText = getReportText(reportLanguage);
 
+  const loadInitialHistoryForScope = useCallback(() => loadInitialHistory(historyScope), [historyScope, loadInitialHistory]);
+  const refreshHistoryForScope = useCallback((silent?: boolean) => refreshHistory(silent, historyScope), [historyScope, refreshHistory]);
+
   useDashboardLifecycle({
-    loadInitialHistory,
-    refreshHistory,
+    loadInitialHistory: loadInitialHistoryForScope,
+    refreshHistory: refreshHistoryForScope,
     syncTaskCreated,
     syncTaskUpdated,
     syncTaskFailed,
@@ -118,6 +135,49 @@ const HomePage: React.FC = () => {
     setShowDeleteConfirm(false);
   }, [deleteSelectedHistory]);
 
+  const handleOpenFeedback = useCallback(() => {
+    setFeedbackStatus(null);
+    setFeedbackCategoryOpen(false);
+    setFeedbackOpen(true);
+  }, []);
+
+  const handleCloseFeedback = useCallback(() => {
+    if (isSubmittingFeedback) {
+      return;
+    }
+    setFeedbackCategoryOpen(false);
+    setFeedbackOpen(false);
+  }, [isSubmittingFeedback]);
+
+  const handleSubmitFeedback = useCallback(async () => {
+    const content = feedbackContent.trim();
+    if (!content) {
+      setFeedbackStatus({ type: 'danger', message: '请先填写问题描述。' });
+      return;
+    }
+
+    setIsSubmittingFeedback(true);
+    setFeedbackStatus(null);
+    try {
+      await feedbackApi.submit({
+        category: feedbackCategory,
+        content,
+        contact: feedbackContact.trim() || undefined,
+        pageUrl: window.location.href,
+      });
+      setFeedbackContent('');
+      setFeedbackContact('');
+      setFeedbackStatus({
+        type: 'success',
+        message: '已接收，反馈已提交。',
+      });
+    } catch {
+      setFeedbackStatus({ type: 'danger', message: '反馈提交失败，请稍后重试。' });
+    } finally {
+      setIsSubmittingFeedback(false);
+    }
+  }, [feedbackCategory, feedbackContact, feedbackContent]);
+
   const sidebarContent = useMemo(
     () => (
       <div className="flex min-h-0 h-full flex-col gap-3 overflow-hidden">
@@ -131,7 +191,10 @@ const HomePage: React.FC = () => {
           selectedIds={selectedIds}
           isDeleting={isDeletingHistory}
           onItemClick={handleHistoryItemClick}
-          onLoadMore={() => void loadMoreHistory()}
+          isAdminView={isAdmin}
+          retentionDays={historyRetentionDays}
+          autoCleanupEnabled={historyAutoCleanupEnabled}
+          onLoadMore={() => void loadMoreHistory(historyScope)}
           onToggleItemSelection={toggleHistorySelection}
           onToggleSelectAll={toggleSelectAllVisible}
           onDeleteSelected={() => setShowDeleteConfirm(true)}
@@ -143,10 +206,14 @@ const HomePage: React.FC = () => {
       activeTasks,
       hasMore,
       historyItems,
+      historyRetentionDays,
+      historyAutoCleanupEnabled,
       isDeletingHistory,
       isLoadingHistory,
       isLoadingMore,
       handleHistoryItemClick,
+      isAdmin,
+      historyScope,
       loadMoreHistory,
       selectedIds,
       selectedReport?.meta.id,
@@ -193,6 +260,13 @@ const HomePage: React.FC = () => {
               />
               推送通知
             </label>
+            <button
+              type="button"
+              onClick={handleOpenFeedback}
+              className="flex h-10 flex-shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-amber-400/30 bg-amber-400/10 px-3 text-xs font-medium text-amber-200 transition-colors hover:bg-amber-400/15"
+            >
+              反馈问题
+            </button>
             <button
               type="button"
               onClick={() => handleSubmitAnalysis()}
@@ -244,7 +318,7 @@ const HomePage: React.FC = () => {
             <div className="fixed inset-0 z-40 md:hidden" onClick={() => setSidebarOpen(false)}>
               <div className="page-drawer-overlay absolute inset-0" />
               <div
-                className="dashboard-card absolute bottom-0 left-0 top-0 flex w-72 flex-col overflow-hidden !rounded-none !rounded-r-xl p-3 shadow-2xl"
+                className="dashboard-card absolute left-0 top-0 flex h-[100dvh] max-h-[100dvh] w-[min(22rem,calc(100vw-1rem))] flex-col !overflow-x-hidden !overflow-y-auto overscroll-contain touch-pan-y [-webkit-overflow-scrolling:touch] !rounded-none !rounded-r-xl p-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))] shadow-2xl"
                 onClick={(event) => event.stopPropagation()}
               >
                 {sidebarContent}
@@ -329,6 +403,124 @@ const HomePage: React.FC = () => {
           reportLanguage={reportLanguage}
           onClose={closeMarkdownDrawer}
         />
+      ) : null}
+
+      {feedbackOpen ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4" role="dialog" aria-modal="true" aria-label="反馈问题">
+          <div className="dashboard-card w-full max-w-lg space-y-4 p-5 shadow-2xl">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h2 className="text-lg font-semibold text-foreground">反馈问题</h2>
+              </div>
+              <button
+                type="button"
+                onClick={handleCloseFeedback}
+                className="rounded-lg px-2 py-1 text-secondary-text hover:bg-hover hover:text-foreground"
+                aria-label="关闭反馈"
+              >
+                ×
+              </button>
+            </div>
+
+            {feedbackStatus ? (
+              <InlineAlert
+                variant={feedbackStatus.type}
+                title={feedbackStatus.type === 'success' ? '提交成功' : feedbackStatus.type === 'warning' ? '已接收' : '提交失败'}
+                message={feedbackStatus.message}
+                className="rounded-xl px-3 py-2 text-xs shadow-none"
+              />
+            ) : null}
+
+            <div className="relative block space-y-1.5 text-sm text-secondary-text">
+              <span id="feedback-category-label">问题类型</span>
+              <button
+                type="button"
+                aria-haspopup="listbox"
+                aria-expanded={feedbackCategoryOpen}
+                aria-labelledby="feedback-category-label feedback-category-selected"
+                onClick={() => setFeedbackCategoryOpen((open) => !open)}
+                className="flex w-full items-center justify-between rounded-xl border border-subtle bg-surface px-3 py-2 text-left text-foreground outline-none transition-colors hover:border-cyan/40 focus:border-cyan/60"
+              >
+                <span id="feedback-category-selected">
+                  {feedbackCategory === 'bug' ? 'Bug / 功能异常' : feedbackCategory === 'iteration' ? '迭代建议' : '其他'}
+                </span>
+                <span className="text-secondary-text">⌄</span>
+              </button>
+              {feedbackCategoryOpen ? (
+                <div
+                  role="listbox"
+                  aria-labelledby="feedback-category-label"
+                  className="absolute z-10 mt-1 w-full overflow-hidden rounded-xl border border-subtle bg-[#101827] shadow-2xl shadow-black/40"
+                >
+                  {([
+                    ['bug', 'Bug / 功能异常'],
+                    ['iteration', '迭代建议'],
+                    ['other', '其他'],
+                  ] as const).map(([value, label]) => {
+                    const active = feedbackCategory === value;
+                    return (
+                      <button
+                        key={value}
+                        type="button"
+                        role="option"
+                        aria-selected={active}
+                        onClick={() => {
+                          setFeedbackCategory(value);
+                          setFeedbackCategoryOpen(false);
+                        }}
+                        className={active
+                          ? 'block w-full bg-cyan/20 px-3 py-2 text-left text-cyan'
+                          : 'block w-full px-3 py-2 text-left text-foreground hover:bg-hover'}
+                      >
+                        {label}
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : null}
+            </div>
+
+            <label className="block space-y-1.5 text-sm text-secondary-text">
+              <span>问题描述</span>
+              <textarea
+                aria-label="问题描述"
+                value={feedbackContent}
+                onChange={(event) => setFeedbackContent(event.target.value)}
+                placeholder="请描述你遇到的问题、操作步骤、股票代码或页面现象。"
+                rows={5}
+                maxLength={2000}
+                className="w-full resize-none rounded-xl border border-subtle bg-surface px-3 py-2 text-foreground outline-none focus:border-cyan/60"
+              />
+            </label>
+
+            <label className="block space-y-1.5 text-sm text-secondary-text">
+              <span>联系方式（选填）</span>
+              <input
+                aria-label="联系方式（选填）"
+                value={feedbackContact}
+                onChange={(event) => setFeedbackContact(event.target.value)}
+                placeholder={currentUser?.username ? `当前用户：${currentUser.username}` : '邮箱 / 微信 / 备注'}
+                maxLength={200}
+                className="w-full rounded-xl border border-subtle bg-surface px-3 py-2 text-foreground outline-none focus:border-cyan/60"
+              />
+            </label>
+
+            <div className="flex justify-end gap-2">
+              <Button variant="ghost" size="sm" onClick={handleCloseFeedback} disabled={isSubmittingFeedback}>
+                取消
+              </Button>
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={handleSubmitFeedback}
+                isLoading={isSubmittingFeedback}
+                loadingText="提交中..."
+              >
+                提交反馈
+              </Button>
+            </div>
+          </div>
+        </div>
       ) : null}
 
       <ConfirmDialog

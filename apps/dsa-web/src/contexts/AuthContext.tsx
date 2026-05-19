@@ -10,9 +10,13 @@ type AuthContextValue = {
   passwordSet: boolean;
   passwordChangeable: boolean;
   setupState: 'enabled' | 'password_retained' | 'no_password';
+  currentUser: { id?: number | null; username: string; role: 'admin' | 'user' } | null;
+  registrationEnabled: boolean;
+  registrationInviteRequired: boolean;
   isLoading: boolean;
   loadError: ParsedApiError | null;
-  login: (password: string, passwordConfirm?: string) => Promise<{ success: boolean; error?: ParsedApiError }>;
+  login: (username: string, password: string, passwordConfirm?: string) => Promise<{ success: boolean; error?: ParsedApiError }>;
+  register: (username: string, password: string, passwordConfirm: string, captchaToken: string, captchaAnswer: string, inviteCode?: string) => Promise<{ success: boolean; error?: ParsedApiError }>;
   changePassword: (
     currentPassword: string,
     newPassword: string,
@@ -44,6 +48,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [passwordSet, setPasswordSet] = useState(false);
   const [passwordChangeable, setPasswordChangeable] = useState(false);
   const [setupState, setSetupState] = useState<'enabled' | 'password_retained' | 'no_password'>('no_password');
+  const [currentUser, setCurrentUser] = useState<{ id?: number | null; username: string; role: 'admin' | 'user' } | null>(null);
+  const [registrationEnabled, setRegistrationEnabled] = useState(true);
+  const [registrationInviteRequired, setRegistrationInviteRequired] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState<ParsedApiError | null>(null);
 
@@ -57,6 +64,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setPasswordSet(status.passwordSet ?? false);
       setPasswordChangeable(status.passwordChangeable ?? false);
       setSetupState(status.setupState);
+      setCurrentUser(status.currentUser ?? null);
+      setRegistrationEnabled(status.registrationEnabled ?? true);
+      setRegistrationInviteRequired(status.registrationInviteRequired ?? false);
       if (status.authEnabled && !status.loggedIn) {
         useStockPoolStore.getState().resetDashboardState();
       }
@@ -67,6 +77,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setPasswordSet(false);
       setPasswordChangeable(false);
       setSetupState('no_password');
+      setCurrentUser(null);
+      setRegistrationEnabled(true);
+      setRegistrationInviteRequired(false);
       useStockPoolStore.getState().resetDashboardState();
     } finally {
       setIsLoading(false);
@@ -79,15 +92,36 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const login = useCallback(
     async (
+      username: string,
       password: string,
       passwordConfirm?: string
     ): Promise<{ success: boolean; error?: ParsedApiError }> => {
       try {
-        await authApi.login(password, passwordConfirm);
+        await authApi.login(username, password, passwordConfirm);
         await fetchStatus();
         return { success: true };
       } catch (err: unknown) {
         return { success: false, error: extractLoginError(err) };
+      }
+    },
+    [fetchStatus]
+  );
+
+  const register = useCallback(
+    async (
+      username: string,
+      password: string,
+      passwordConfirm: string,
+      captchaToken: string,
+      captchaAnswer: string,
+      inviteCode?: string
+    ): Promise<{ success: boolean; error?: ParsedApiError }> => {
+      try {
+        await authApi.register(username, password, passwordConfirm, captchaToken, captchaAnswer, inviteCode);
+        await fetchStatus();
+        return { success: true };
+      } catch (err: unknown) {
+        return { success: false, error: getParsedApiError(err) };
       }
     },
     [fetchStatus]
@@ -132,9 +166,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         passwordSet,
         passwordChangeable,
         setupState,
+        currentUser,
+        registrationEnabled,
+        registrationInviteRequired,
         isLoading,
         loadError,
         login,
+        register,
         changePassword,
         logout,
         refreshStatus: fetchStatus,

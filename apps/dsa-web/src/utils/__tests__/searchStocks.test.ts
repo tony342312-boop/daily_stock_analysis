@@ -68,6 +68,18 @@ const mockIndex: StockIndexItem[] = [
     popularity: 98,
   },
   {
+    canonicalCode: "SE.US",
+    displayCode: "SE",
+    nameZh: "Sea Limited",
+    pinyinFull: "sealimited",
+    pinyinAbbr: "sl",
+    aliases: ["sea", "sea limited", "shopee", "虾皮"],
+    market: "US",
+    assetType: "stock",
+    active: true,
+    popularity: 96,
+  },
+  {
     canonicalCode: "600000.SH",
     displayCode: "600000",
     nameZh: "浦发银行",
@@ -196,6 +208,14 @@ describe('searchStocks', () => {
     expect(results).toHaveLength(1);
     expect(results[0].canonicalCode).toBe('AAPL.US');
     expect(results[0].market).toBe('US');
+  });
+
+  test('Sea Limited / Shopee aliases resolve to NYSE SE instead of SEA', () => {
+    for (const query of ['sea', 'sea limited', 'shopee', '虾皮']) {
+      const results = searchStocks(query, mockIndex);
+      expect(results[0].canonicalCode).toBe('SE.US');
+      expect(results[0].displayCode).toBe('SE');
+    }
   });
 
   test('supports half-width queries for full-width A-share suffix names', () => {
@@ -413,6 +433,94 @@ describe('searchStocks', () => {
       const results = searchStocks('茅台', mockIndex);
       // Should match 贵州茅台
       expect(results.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe('cross-market company lookup coverage', () => {
+    const enrichedIndex: StockIndexItem[] = [
+      ...mockIndex,
+      {
+        canonicalCode: 'AAPL.US',
+        displayCode: 'AAPL',
+        nameZh: '苹果',
+        nameEn: 'Apple Inc.',
+        pinyinFull: 'pingguo',
+        pinyinAbbr: 'pg',
+        aliases: ['Apple', 'Apple Inc', 'Apple Inc.'],
+        market: 'US',
+        assetType: 'stock',
+        active: true,
+        popularity: 100,
+      },
+      {
+        canonicalCode: 'LITE.US',
+        displayCode: 'LITE',
+        nameZh: 'Lumentum Holdings Inc.',
+        nameEn: 'Lumentum Holdings Inc.',
+        pinyinFull: 'lumentumholdings',
+        pinyinAbbr: 'lh',
+        aliases: ['Lumentum', 'Lumentum Holdings', 'Lumentum Holdings Inc', '光通信', '光模块'],
+        market: 'US',
+        assetType: 'stock',
+        active: true,
+        popularity: 100,
+      },
+      {
+        canonicalCode: '002335.SZ',
+        displayCode: '002335',
+        nameZh: '科华数据',
+        pinyinFull: 'kehuashuju',
+        pinyinAbbr: 'khsj',
+        aliases: ['科华', 'Kehua Data', 'Kehua Data Co'],
+        market: 'CN',
+        assetType: 'stock',
+        active: true,
+        popularity: 100,
+      },
+      {
+        canonicalCode: '600875.SH',
+        displayCode: '600875',
+        nameZh: '东方电气',
+        pinyinFull: 'dongfangdianqi',
+        pinyinAbbr: 'dfdq',
+        aliases: ['东方电', 'Dongfang Electric'],
+        market: 'CN',
+        assetType: 'stock',
+        active: true,
+        popularity: 100,
+      },
+      {
+        canonicalCode: '03690.HK',
+        displayCode: '03690',
+        nameZh: '美团',
+        pinyinFull: 'meituan',
+        pinyinAbbr: 'mt',
+        aliases: ['Meituan', 'Meituan Dianping'],
+        market: 'HK',
+        assetType: 'stock',
+        active: true,
+        popularity: 100,
+      },
+    ];
+
+    test.each([
+      ['lite', 'LITE.US'],
+      ['Lumentum', 'LITE.US'],
+      ['Lumentum Holdings', 'LITE.US'],
+      ['apple', 'AAPL.US'],
+      ['sea limited', 'SE.US'],
+      ['shopee', 'SE.US'],
+      ['002335', '002335.SZ'],
+      ['科华', '002335.SZ'],
+      ['Kehua Data', '002335.SZ'],
+      ['600875', '600875.SH'],
+      ['dongfang electric', '600875.SH'],
+      ['00700', '00700.HK'],
+      ['03690', '03690.HK'],
+      ['meituan', '03690.HK'],
+    ])('resolves %s to %s', (query, expectedCode) => {
+      const results = searchStocks(query, enrichedIndex);
+      expect(results[0]?.canonicalCode).toBe(expectedCode);
     });
   });
 });

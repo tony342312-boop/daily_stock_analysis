@@ -1,5 +1,5 @@
 import type React from 'react';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { motion, useMotionValue, useTransform, useSpring } from "motion/react";
 import { Lock, Loader2, Cpu, TrendingUp, Network, ShieldCheck } from "lucide-react";
 import { Button, Input, ParticleBackground } from '../components/common';
@@ -8,9 +8,10 @@ import type { ParsedApiError } from '../api/error';
 import { isParsedApiError } from '../api/error';
 import { useAuth } from '../hooks';
 import { SettingsAlert } from '../components/settings';
+import { authApi } from '../api/auth';
 
 const LoginPage: React.FC = () => {
-  const { login, passwordSet, setupState } = useAuth();
+  const { login, register, passwordSet, setupState, registrationEnabled, registrationInviteRequired } = useAuth();
   const navigate = useNavigate();
 
   // Set page title
@@ -22,12 +23,38 @@ const LoginPage: React.FC = () => {
   const redirect =
     rawRedirect.startsWith('/') && !rawRedirect.startsWith('//') ? rawRedirect : '/';
 
+  const [mode, setMode] = useState<'login' | 'register'>('login');
+  const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [passwordConfirm, setPasswordConfirm] = useState('');
+  const [captchaQuestion, setCaptchaQuestion] = useState('');
+  const [captchaToken, setCaptchaToken] = useState('');
+  const [captchaAnswer, setCaptchaAnswer] = useState('');
+  const [inviteCode, setInviteCode] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | ParsedApiError | null>(null);
 
   const isFirstTime = setupState === 'no_password' || !passwordSet;
+  const isRegisterMode = mode === 'register' && !isFirstTime;
+
+
+  const loadCaptcha = useCallback(async () => {
+    try {
+      const challenge = await authApi.getCaptcha();
+      setCaptchaQuestion(challenge.question);
+      setCaptchaToken(challenge.captchaToken);
+      setCaptchaAnswer('');
+    } catch {
+      setCaptchaQuestion('验证码加载失败，请刷新重试');
+      setCaptchaToken('');
+    }
+  }, []);
+
+  useEffect(() => {
+    if (isRegisterMode) {
+      void loadCaptcha();
+    }
+  }, [isRegisterMode, loadCaptcha]);
 
   // 3D Tilt effect values
   const mouseX = useMotionValue(0);
@@ -51,17 +78,26 @@ const LoginPage: React.FC = () => {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
-    if (isFirstTime && password !== passwordConfirm) {
+    if ((isFirstTime || isRegisterMode) && password !== passwordConfirm) {
       setError('两次输入的密码不一致');
+      return;
+    }
+    if (!isFirstTime && !username.trim()) {
+      setError('请输入用户名');
       return;
     }
     setIsSubmitting(true);
     try {
-      const result = await login(password, isFirstTime ? passwordConfirm : undefined);
+      const result = isRegisterMode
+        ? await register(username.trim(), password, passwordConfirm, captchaToken, captchaAnswer, inviteCode.trim() || undefined)
+        : await login(isFirstTime ? '' : username.trim(), password, isFirstTime ? passwordConfirm : undefined);
       if (result.success) {
         navigate(redirect, { replace: true });
       } else {
-        setError(result.error ?? '登录失败');
+        setError(result.error ?? (isRegisterMode ? '注册失败' : '登录失败'));
+        if (isRegisterMode) {
+          void loadCaptcha();
+        }
       }
     } finally {
       setIsSubmitting(false);
@@ -159,19 +195,35 @@ const LoginPage: React.FC = () => {
                 ) : (
                   <>
                     <Lock className="h-5 w-5 text-[var(--login-accent-text)]" />
-                    <span>管理员登录</span>
+                    <span>{isRegisterMode ? '注册账号' : '账号登录'}</span>
                   </>
                 )}
               </h1>
               <p className="mt-2 text-sm text-[var(--login-text-secondary)]">
                 {isFirstTime
                   ? '首次启用认证，请为系统工作台设置管理员密码。'
-                  : '访问 DSA 量化决策引擎需要有效的身份凭证。'}
+                  : isRegisterMode
+                    ? registrationEnabled ? '创建普通账号后即可使用自己的查询记录空间。' : '当前服务器已关闭普通用户注册，请联系管理员。'
+                    : '请输入账号和密码访问 DSA 量化决策引擎。'}
               </p>
             </div>
 
             <form onSubmit={handleSubmit} className="space-y-6">
               <div className="space-y-4">
+                {!isFirstTime && (
+                  <Input
+                    id="username"
+                    type="text"
+                    appearance="login"
+                    label="用户名"
+                    placeholder="请输入用户名"
+                    value={username}
+                    onChange={(e) => setUsername(e.target.value)}
+                    disabled={isSubmitting || (isRegisterMode && !registrationEnabled)}
+                    autoComplete="username"
+                  />
+                )}
+
                 <Input
                   id="password"
                   type="password"
@@ -179,15 +231,15 @@ const LoginPage: React.FC = () => {
                   allowTogglePassword
                   iconType="password"
                   label={isFirstTime ? '管理员密码' : '登录密码'}
-                  placeholder={isFirstTime ? '请设置 6 位以上密码' : '请输入密码'}
+                  placeholder={isFirstTime ? '请设置 6 位以上密码' : '6-16 位，不能纯数字'}
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   disabled={isSubmitting}
                   autoFocus
-                  autoComplete={isFirstTime ? 'new-password' : 'current-password'}
+                  autoComplete={isFirstTime || isRegisterMode ? 'new-password' : 'current-password'}
                 />
 
-                {isFirstTime && (
+                {(isFirstTime || isRegisterMode) && (
                   <Input
                     id="passwordConfirm"
                     type="password"
@@ -195,12 +247,49 @@ const LoginPage: React.FC = () => {
                     allowTogglePassword
                     iconType="password"
                     label="确认密码"
-                    placeholder="再次确认管理员密码"
+                    placeholder={isFirstTime ? '请再次输入管理员密码' : '请再次输入 6-16 位登录密码'}
                     value={passwordConfirm}
                     onChange={(e) => setPasswordConfirm(e.target.value)}
                     disabled={isSubmitting}
                     autoComplete="new-password"
                   />
+                )}
+
+                {isRegisterMode && (
+                  <div className="space-y-2">
+                    {!registrationEnabled ? (
+                      <SettingsAlert
+                        title="注册已关闭"
+                        message="当前服务器不开放普通用户自助注册，请联系管理员创建账号。"
+                        variant="warning"
+                      />
+                    ) : null}
+                    {registrationEnabled && registrationInviteRequired ? (
+                      <Input
+                        id="inviteCode"
+                        type="text"
+                        appearance="login"
+                        label="邀请码"
+                        placeholder="请输入管理员提供的邀请码"
+                        value={inviteCode}
+                        onChange={(e) => setInviteCode(e.target.value)}
+                        disabled={isSubmitting}
+                      />
+                    ) : null}
+                    <div className="rounded-xl border border-[var(--login-accent-border)] bg-[var(--login-accent-soft)] px-4 py-3 text-sm text-[var(--login-text-primary)]">
+                      验证码：{captchaQuestion || '加载中...'}
+                    </div>
+                    <Input
+                      id="captchaAnswer"
+                      type="text"
+                      appearance="login"
+                      label="验证码答案"
+                      placeholder="请输入上面算式的结果"
+                      value={captchaAnswer}
+                      onChange={(e) => setCaptchaAnswer(e.target.value)}
+                      disabled={isSubmitting || !registrationEnabled}
+                    />
+                  </div>
                 )}
               </div>
 
@@ -224,20 +313,33 @@ const LoginPage: React.FC = () => {
                 variant="primary"
                 size="lg"
                 className="group/btn relative h-12 w-full overflow-hidden rounded-xl border-0 bg-gradient-to-r from-[var(--login-brand-button-start)] to-[var(--login-brand-button-end)] font-medium text-[var(--login-button-text)] shadow-lg shadow-[0_18px_36px_hsl(214_100%_8%_/_0.24)] hover:from-[var(--login-brand-button-start-hover)] hover:to-[var(--login-brand-button-end-hover)]"
-                disabled={isSubmitting}
+                disabled={isSubmitting || (isRegisterMode && !registrationEnabled)}
               >
                 <div className="relative z-10 flex items-center justify-center gap-2">
                   {isSubmitting ? (
                     <>
                       <Loader2 className="h-4 w-4 animate-spin" />
-                      <span>{isFirstTime ? '初始化中...' : '正在建立连接...'}</span>
+                      <span>{isFirstTime ? '初始化中...' : isRegisterMode ? '正在注册...' : '正在建立连接...'}</span>
                     </>
                   ) : (
-                    <span>{isFirstTime ? '完成设置并登录' : '授权进入工作台'}</span>
+                    <span>{isFirstTime ? '完成设置并登录' : isRegisterMode ? '注册并进入工作台' : '授权进入工作台'}</span>
                   )}
                 </div>
                 <div className="absolute inset-0 z-0 bg-gradient-to-r from-transparent via-white/10 to-transparent -translate-x-full group-hover:animate-[shimmer_1.5s_infinite] pointer-events-none" />
               </Button>
+              {!isFirstTime && (
+                <button
+                  type="button"
+                  className="w-full text-center text-xs text-[var(--login-text-secondary)] hover:text-[var(--login-accent-text)]"
+                  onClick={() => {
+                    setMode(isRegisterMode ? 'login' : 'register');
+                    setError(null);
+                  }}
+                  disabled={isSubmitting}
+                >
+                  {isRegisterMode ? '已有账号？返回登录' : '没有账号？注册一个普通账号'}
+                </button>
+              )}
             </form>
           </div>
         </motion.div>

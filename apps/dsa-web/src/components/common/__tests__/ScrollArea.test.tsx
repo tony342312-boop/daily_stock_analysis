@@ -20,4 +20,17 @@ describe('ScrollArea', () => {
     expect(viewport).toHaveTextContent('scroll content');
     expect(viewport.parentElement).toHaveClass('outer-shell');
   });
+
+  it('enables momentum touch scrolling for fixed mobile drawers', () => {
+    render(
+      <ScrollArea testId="mobile-scroll-viewport">
+        <div>mobile drawer content</div>
+      </ScrollArea>
+    );
+
+    const viewport = screen.getByTestId('mobile-scroll-viewport');
+    expect(viewport).toHaveClass('touch-pan-y');
+    expect(viewport).toHaveClass('overscroll-contain');
+    expect(viewport).toHaveClass('[-webkit-overflow-scrolling:touch]');
+  });
 });

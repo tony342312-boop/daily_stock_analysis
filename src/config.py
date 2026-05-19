@@ -657,10 +657,33 @@ class Config:
     bocha_api_keys: List[str] = field(default_factory=list)  # Bocha API Keys
     minimax_api_keys: List[str] = field(default_factory=list)  # MiniMax API Keys
     tavily_api_keys: List[str] = field(default_factory=list)  # Tavily API Keys
+    exa_api_keys: List[str] = field(default_factory=list)  # Exa API Keys
     brave_api_keys: List[str] = field(default_factory=list)  # Brave Search API Keys
     serpapi_keys: List[str] = field(default_factory=list)  # SerpAPI Keys
     searxng_base_urls: List[str] = field(default_factory=list)  # SearXNG instance URLs (self-hosted, no quota)
     searxng_public_instances_enabled: bool = True  # Auto-discover public SearXNG instances when base URLs are absent
+    ddg_search_enabled: bool = False  # DuckDuckGo HTML fallback (free, no key)
+    google_news_rss_enabled: bool = False  # Google News RSS fallback (free, no key)
+    bing_news_rss_enabled: bool = False  # Bing News RSS fallback (free, no key)
+    multi_search_engine_enabled: bool = False  # Aggregate free search fallbacks
+
+    # === SEC EDGAR (US stocks only) ===
+    sec_edgar_enabled: bool = True  # Use SEC EDGAR submissions/companyfacts for US filings and financials
+    sec_edgar_user_agent: str = "daily_stock_analysis/1.0 admin@stock.cn.mt"  # SEC fair-access User-Agent
+    sec_edgar_timeout_seconds: float = 15.0  # SEC request timeout / budget for US fundamentals
+
+    # === FRED Macro Context (US stocks only) ===
+    fred_api_key: Optional[str] = None  # St. Louis Fed FRED API key for macro indicators
+    fred_enabled: bool = True  # Enable FRED macro indicators when FRED_API_KEY is configured
+    fred_timeout_seconds: float = 6.0  # FRED request timeout / budget
+
+    # === Peer Valuation Context (US stocks first) ===
+    peer_valuation_enabled: bool = True  # Enable peer PE/PB/market-cap comparison for configured US tickers
+    peer_valuation_timeout_seconds: float = 15.0  # Timeout budget for peer valuation fetches
+    peer_valuation_max_peers: int = 5  # Max peers shown in one report
+    us_peer_valuation_map: str = ""  # Optional JSON override, e.g. {"AAPL":["DELL","HPQ"]}
+    cn_peer_valuation_map: str = ""  # Optional JSON override, e.g. {"600519":["000858","000568"]}
+    hk_peer_valuation_map: str = ""  # Optional JSON override, e.g. {"HK00700":["HK09999","HK03690"]}
 
     # === Social Sentiment (US stocks only, api.adanos.org) ===
     social_sentiment_api_key: Optional[str] = None
@@ -701,6 +724,13 @@ class Config:
     feishu_webhook_url: Optional[str] = None
     feishu_webhook_secret: Optional[str] = None  # 自定义机器人签名密钥（可选）
     feishu_webhook_keyword: Optional[str] = None  # 自定义机器人关键词（可选）
+    feishu_feedback_webhook_url: Optional[str] = None  # 用户反馈专用飞书 Webhook（未配置时复用 FEISHU_WEBHOOK_URL）
+    feishu_feedback_webhook_secret: Optional[str] = None  # 用户反馈专用机器人签名密钥（可选）
+    feishu_feedback_webhook_keyword: Optional[str] = None  # 用户反馈专用机器人关键词（可选）
+    feishu_app_id: Optional[str] = None  # 飞书开放平台 App ID（用于用户反馈一对一通知）
+    feishu_app_secret: Optional[str] = None  # 飞书开放平台 App Secret（敏感）
+    feishu_feedback_receive_id: Optional[str] = None  # 用户反馈一对一通知接收者 ID（如 open_id）
+    feishu_feedback_receive_id_type: str = "open_id"  # receive_id_type：open_id/user_id/union_id/email/chat_id
     
     # Telegram 配置（需要同时配置 Bot Token 和 Chat ID）
     telegram_bot_token: Optional[str] = None  # Bot Token（@BotFather 获取）
@@ -934,6 +964,7 @@ class Config:
     )
     _BOOTSTRAP_RUNTIME_ENV_OVERRIDES_CAPTURED = False
     _BOOTSTRAP_RUNTIME_ENV_OVERRIDES = frozenset()
+    _BOOTSTRAP_RUNTIME_ENV_KEYS_PRESENT = frozenset()
 
     def __post_init__(self) -> None:
         _log = logging.getLogger(__name__)
@@ -1200,6 +1231,14 @@ class Config:
         
         tavily_keys_str = os.getenv('TAVILY_API_KEYS', '')
         tavily_api_keys = [k.strip() for k in tavily_keys_str.split(',') if k.strip()]
+
+        exa_keys_str = ",".join(
+            v for v in (os.getenv('EXA_API_KEYS', ''), os.getenv('EXA_API_KEY', '')) if v
+        )
+        exa_api_keys: List[str] = []
+        for key in [k.strip() for k in exa_keys_str.split(',') if k.strip()]:
+            if key not in exa_api_keys:
+                exa_api_keys.append(key)
         
         serpapi_keys_str = os.getenv('SERPAPI_API_KEYS', '')
         serpapi_keys = [k.strip() for k in serpapi_keys_str.split(',') if k.strip()]
@@ -1224,6 +1263,22 @@ class Config:
         searxng_public_instances_enabled = parse_env_bool(
             os.getenv('SEARXNG_PUBLIC_INSTANCES_ENABLED'),
             default=True,
+        )
+        ddg_search_enabled = parse_env_bool(
+            os.getenv('DDG_SEARCH_ENABLED'),
+            default=False,
+        )
+        google_news_rss_enabled = parse_env_bool(
+            os.getenv('GOOGLE_NEWS_RSS_ENABLED'),
+            default=False,
+        )
+        bing_news_rss_enabled = parse_env_bool(
+            os.getenv('BING_NEWS_RSS_ENABLED'),
+            default=False,
+        )
+        multi_search_engine_enabled = parse_env_bool(
+            os.getenv('MULTI_SEARCH_ENGINE_ENABLED'),
+            default=False,
         )
 
         # 企微消息类型与最大字节数逻辑
@@ -1257,6 +1312,11 @@ class Config:
             'SCHEDULE_RUN_IMMEDIATELY',
             prefer_env_file=True,
         )
+        if (
+            cls._has_bootstrap_runtime_env_override('RUN_IMMEDIATELY')
+            and not cls._had_bootstrap_runtime_env_key('SCHEDULE_RUN_IMMEDIATELY')
+        ):
+            schedule_run_immediately_env = None
         schedule_run_immediately = (
             schedule_run_immediately_env.lower() == 'true'
             if schedule_run_immediately_env is not None
@@ -1328,10 +1388,50 @@ class Config:
             bocha_api_keys=bocha_api_keys,
             minimax_api_keys=minimax_api_keys,
             tavily_api_keys=tavily_api_keys,
+            exa_api_keys=exa_api_keys,
             brave_api_keys=brave_api_keys,
             serpapi_keys=serpapi_keys,
             searxng_base_urls=searxng_base_urls,
             searxng_public_instances_enabled=searxng_public_instances_enabled,
+            ddg_search_enabled=ddg_search_enabled,
+            google_news_rss_enabled=google_news_rss_enabled,
+            bing_news_rss_enabled=bing_news_rss_enabled,
+            multi_search_engine_enabled=multi_search_engine_enabled,
+            sec_edgar_enabled=os.getenv('SEC_EDGAR_ENABLED', 'true').lower() == 'true',
+            sec_edgar_user_agent=os.getenv(
+                'SEC_EDGAR_USER_AGENT',
+                'daily_stock_analysis/1.0 admin@stock.cn.mt',
+            ),
+            sec_edgar_timeout_seconds=parse_env_float(
+                os.getenv('SEC_EDGAR_TIMEOUT_SECONDS'),
+                15.0,
+                field_name='SEC_EDGAR_TIMEOUT_SECONDS',
+                minimum=1.0,
+            ),
+            fred_api_key=os.getenv('FRED_API_KEY') or None,
+            fred_enabled=os.getenv('FRED_ENABLED', 'true').lower() == 'true',
+            fred_timeout_seconds=parse_env_float(
+                os.getenv('FRED_TIMEOUT_SECONDS'),
+                6.0,
+                field_name='FRED_TIMEOUT_SECONDS',
+                minimum=1.0,
+            ),
+            peer_valuation_enabled=os.getenv('PEER_VALUATION_ENABLED', 'true').lower() == 'true',
+            peer_valuation_timeout_seconds=parse_env_float(
+                os.getenv('PEER_VALUATION_TIMEOUT_SECONDS'),
+                15.0,
+                field_name='PEER_VALUATION_TIMEOUT_SECONDS',
+                minimum=1.0,
+            ),
+            peer_valuation_max_peers=parse_env_int(
+                os.getenv('PEER_VALUATION_MAX_PEERS'),
+                5,
+                field_name='PEER_VALUATION_MAX_PEERS',
+                minimum=1,
+            ),
+            us_peer_valuation_map=os.getenv('US_PEER_VALUATION_MAP', ''),
+            cn_peer_valuation_map=os.getenv('CN_PEER_VALUATION_MAP', ''),
+            hk_peer_valuation_map=os.getenv('HK_PEER_VALUATION_MAP', ''),
             social_sentiment_api_key=os.getenv('SOCIAL_SENTIMENT_API_KEY') or None,
             social_sentiment_api_url=os.getenv('SOCIAL_SENTIMENT_API_URL', 'https://api.adanos.org').rstrip('/'),
             news_max_age_days=parse_env_int(os.getenv('NEWS_MAX_AGE_DAYS'), 3, field_name='NEWS_MAX_AGE_DAYS', minimum=1),
@@ -1393,6 +1493,11 @@ class Config:
             feishu_webhook_url=os.getenv('FEISHU_WEBHOOK_URL'),
             feishu_webhook_secret=os.getenv('FEISHU_WEBHOOK_SECRET'),
             feishu_webhook_keyword=os.getenv('FEISHU_WEBHOOK_KEYWORD'),
+            feishu_feedback_webhook_url=os.getenv('FEISHU_FEEDBACK_WEBHOOK_URL'),
+            feishu_feedback_webhook_secret=os.getenv('FEISHU_FEEDBACK_WEBHOOK_SECRET'),
+            feishu_feedback_webhook_keyword=os.getenv('FEISHU_FEEDBACK_WEBHOOK_KEYWORD'),
+            feishu_feedback_receive_id=os.getenv('FEISHU_FEEDBACK_RECEIVE_ID'),
+            feishu_feedback_receive_id_type=os.getenv('FEISHU_FEEDBACK_RECEIVE_ID_TYPE', 'open_id'),
             telegram_bot_token=os.getenv('TELEGRAM_BOT_TOKEN'),
             telegram_chat_id=os.getenv('TELEGRAM_CHAT_ID'),
             telegram_message_thread_id=os.getenv('TELEGRAM_MESSAGE_THREAD_ID'),
@@ -1932,22 +2037,30 @@ class Config:
             return
 
         explicit_overrides = set()
+        explicit_keys_present = set()
         for key in cls._WEBUI_RUNTIME_ENV_FILE_PRIORITY_KEYS:
             env_value = os.environ.get(key)
             if env_value is None:
                 continue
+            explicit_keys_present.add(key)
 
             file_value = cls._get_env_file_value(key)
             if file_value is None or env_value != file_value:
                 explicit_overrides.add(key)
 
         cls._BOOTSTRAP_RUNTIME_ENV_OVERRIDES = frozenset(explicit_overrides)
+        cls._BOOTSTRAP_RUNTIME_ENV_KEYS_PRESENT = frozenset(explicit_keys_present)
         cls._BOOTSTRAP_RUNTIME_ENV_OVERRIDES_CAPTURED = True
 
     @classmethod
     def _has_bootstrap_runtime_env_override(cls, key: str) -> bool:
         cls._capture_bootstrap_runtime_env_overrides()
         return key in cls._BOOTSTRAP_RUNTIME_ENV_OVERRIDES
+
+    @classmethod
+    def _had_bootstrap_runtime_env_key(cls, key: str) -> bool:
+        cls._capture_bootstrap_runtime_env_overrides()
+        return key in cls._BOOTSTRAP_RUNTIME_ENV_KEYS_PRESENT
 
     @classmethod
     def _resolve_report_language_env_value(
@@ -2070,6 +2183,7 @@ class Config:
         cls._instance = None
         cls._BOOTSTRAP_RUNTIME_ENV_OVERRIDES_CAPTURED = False
         cls._BOOTSTRAP_RUNTIME_ENV_OVERRIDES = frozenset()
+        cls._BOOTSTRAP_RUNTIME_ENV_KEYS_PRESENT = frozenset()
 
     def has_searxng_enabled(self) -> bool:
         """Whether SearXNG fallback is enabled via self-hosted or public mode."""
@@ -2082,8 +2196,13 @@ class Config:
             or self.bocha_api_keys
             or self.minimax_api_keys
             or self.tavily_api_keys
+            or self.exa_api_keys
             or self.brave_api_keys
             or self.serpapi_keys
+            or self.ddg_search_enabled
+            or self.google_news_rss_enabled
+            or self.bing_news_rss_enabled
+            or self.multi_search_engine_enabled
             or self.has_searxng_enabled()
         )
 

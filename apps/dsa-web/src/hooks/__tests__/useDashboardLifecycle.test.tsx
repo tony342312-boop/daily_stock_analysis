@@ -1,7 +1,19 @@
 import { act, renderHook } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { analysisApi } from '../../api/analysis';
 import { useDashboardLifecycle } from '../useDashboardLifecycle';
 import { useTaskStream } from '../useTaskStream';
+
+vi.mock('../../api/analysis', () => ({
+  analysisApi: {
+    getTasks: vi.fn().mockResolvedValue({
+      total: 0,
+      pending: 0,
+      processing: 0,
+      tasks: [],
+    }),
+  },
+}));
 
 vi.mock('../useTaskStream', () => ({
   useTaskStream: vi.fn(),
@@ -20,6 +32,12 @@ const createTask = () => ({
 describe('useDashboardLifecycle', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(analysisApi.getTasks).mockResolvedValue({
+      total: 0,
+      pending: 0,
+      processing: 0,
+      tasks: [],
+    });
     vi.useFakeTimers();
   });
 

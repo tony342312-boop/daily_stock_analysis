@@ -9,6 +9,7 @@ First login sets initial password; supports web change-password and CLI reset.
 from __future__ import annotations
 
 import base64
+import contextvars
 import getpass
 import hashlib
 import hmac
@@ -30,6 +31,8 @@ RATE_LIMIT_WINDOW_SEC = 300
 RATE_LIMIT_MAX_FAILURES = 5
 SESSION_MAX_AGE_HOURS_DEFAULT = 24
 MIN_PASSWORD_LEN = 6
+MAX_PASSWORD_LEN = 16
+_current_user_ctx: contextvars.ContextVar[dict | None] = contextvars.ContextVar("dsa_current_user", default=None)
 
 # Lazy-loaded state
 _auth_enabled: Optional[bool] = None
@@ -243,6 +246,248 @@ def _validate_password(pwd: str) -> Optional[str]:
     return None
 
 
+
+def get_current_user_context() -> Optional[dict]:
+    """Return the current request user context if set."""
+    return _current_user_ctx.get()
+
+
+def set_current_user_context(user: Optional[dict]):
+    """Set current request user context and return the reset token."""
+    return _current_user_ctx.set(user)
+
+
+def reset_current_user_context(token) -> None:
+    """Reset current request user context."""
+    _current_user_ctx.reset(token)
+
+
+def _validate_username(username: str) -> str:
+    username = (username or "").strip()
+    if not username:
+        raise ValueError("用户名不能为空")
+    if len(username) > 64:
+        raise ValueError("用户名不能超过 64 位")
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.")
+    if any(ch not in allowed for ch in username):
+        raise ValueError("用户名只能包含字母、数字、下划线、中划线和点")
+    return username
+
+
+def _validate_account_password(password: str) -> None:
+    err = _validate_password(password)
+    if err:
+        raise ValueError(err)
+    if len(password) > MAX_PASSWORD_LEN:
+        raise ValueError(f"密码不能超过 {MAX_PASSWORD_LEN} 位")
+    if password.isdigit():
+        raise ValueError("密码不能为纯数字")
+
+
+def _hash_password(password: str) -> str:
+    salt = secrets.token_bytes(32)
+    derived = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt=salt, iterations=PBKDF2_ITERATIONS)
+    return f"{base64.standard_b64encode(salt).decode('ascii')}:{base64.standard_b64encode(derived).decode('ascii')}"
+
+
+def create_user(username: str, password: str, role: str = "user"):
+    """Create an application user with a hashed password."""
+    from src.storage import AppUser, DatabaseManager
+
+    username = _validate_username(username)
+    role = "admin" if role == "admin" else "user"
+    _validate_account_password(password)
+    db = DatabaseManager.get_instance()
+    with db.get_session() as session:
+        existing = session.query(AppUser).filter(AppUser.username == username).first()
+        if existing:
+            raise ValueError("用户名已存在")
+        user = AppUser(username=username, password_hash=_hash_password(password), role=role, status="active")
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+        return user
+
+
+def get_user_by_username(username: str):
+    from src.storage import AppUser, DatabaseManager
+
+    username = (username or "").strip()
+    if not username:
+        return None
+    db = DatabaseManager.get_instance()
+    with db.get_session() as session:
+        return session.query(AppUser).filter(AppUser.username == username).first()
+
+
+def get_user_by_id(user_id: int):
+    from src.storage import AppUser, DatabaseManager
+
+    db = DatabaseManager.get_instance()
+    with db.get_session() as session:
+        return session.query(AppUser).filter(AppUser.id == int(user_id)).first()
+
+
+def verify_user_password(username: str, password: str) -> bool:
+    user = get_user_by_username(username)
+    if not user or user.status != "active":
+        return False
+    parsed = _parse_password_hash(user.password_hash)
+    if not parsed:
+        return False
+    return _verify_password_hash(password, parsed[0], parsed[1])
+
+
+def authenticate_user(username: str, password: str) -> Optional[dict]:
+    user = get_user_by_username(username)
+    if not user or user.status != "active":
+        return None
+    parsed = _parse_password_hash(user.password_hash)
+    if not parsed or not _verify_password_hash(password, parsed[0], parsed[1]):
+        return None
+    try:
+        from src.storage import DatabaseManager
+        db = DatabaseManager.get_instance()
+        with db.get_session() as session:
+            db_user = session.query(type(user)).filter(type(user).id == user.id).first()
+            if db_user:
+                db_user.last_login_at = datetime_now()
+                session.commit()
+    except Exception:
+        logger.debug("Failed to update last_login_at", exc_info=True)
+    return {"id": user.id, "username": user.username, "role": user.role}
+
+
+def datetime_now():
+    from datetime import datetime
+    return datetime.now()
+
+
+def create_registration_captcha() -> dict:
+    """Create a signed arithmetic captcha challenge."""
+    secret = _load_session_secret() or secrets.token_bytes(32)
+    a = secrets.randbelow(8) + 2
+    b = secrets.randbelow(8) + 2
+    answer = str(a + b)
+    ts = str(int(time.time()))
+    nonce = secrets.token_urlsafe(8)
+    payload = f"{answer}.{ts}.{nonce}"
+    sig = hmac.new(secret, payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    token = base64.urlsafe_b64encode(f"{payload}.{sig}".encode("utf-8")).decode("ascii")
+    return {"question": f"{a} + {b} = ?", "captchaToken": token, "answer": answer}
+
+
+def verify_registration_captcha(token: str, answer: str, max_age_seconds: int = 600) -> bool:
+    secret = _load_session_secret() or secrets.token_bytes(32)
+    try:
+        raw = base64.urlsafe_b64decode((token or "").encode("ascii")).decode("utf-8")
+        expected_answer, ts_str, nonce, sig = raw.split(".", 3)
+        payload = f"{expected_answer}.{ts_str}.{nonce}"
+        expected_sig = hmac.new(secret, payload.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected_sig):
+            return False
+        if time.time() - int(ts_str) > max_age_seconds:
+            return False
+        return str(answer or "").strip() == expected_answer
+    except Exception:
+        return False
+
+
+def is_registration_enabled() -> bool:
+    """Return whether public registration is enabled."""
+    value = (os.getenv("DSA_REGISTRATION_ENABLED") or "true").strip().lower()
+    return value in {"true", "1", "yes", "on"}
+
+
+def get_registration_invite_code() -> str:
+    """Return configured registration invite code, if any."""
+    return (os.getenv("DSA_REGISTRATION_INVITE_CODE") or "").strip()
+
+
+def is_registration_invite_required() -> bool:
+    """Return whether registration requires invite code."""
+    return bool(get_registration_invite_code())
+
+
+def ensure_admin_user(username: Optional[str] = None, password: Optional[str] = None) -> None:
+    """Ensure the configured admin user exists and matches the configured password.
+
+    This staging deployment intentionally seeds the primary admin from server-side env.
+    If the configured admin already exists, keep it active/admin and rotate its
+    password to the configured value so staging can be recovered predictably.
+    """
+    username = (username or os.getenv("DSA_ADMIN_USERNAME") or "").strip()
+    password = (password or os.getenv("DSA_ADMIN_PASSWORD") or "").strip()
+    if not username or not password:
+        return
+    try:
+        _validate_account_password(password)
+        from src.storage import AppUser, DatabaseManager
+        db = DatabaseManager.get_instance()
+        with db.get_session() as session:
+            user = session.query(AppUser).filter(AppUser.username == username).first()
+            if user:
+                user.role = "admin"
+                user.status = "active"
+                user.password_hash = _hash_password(password)
+            else:
+                session.add(AppUser(username=username, password_hash=_hash_password(password), role="admin", status="active"))
+            session.commit()
+    except Exception as exc:
+        logger.warning("Failed to ensure configured admin user %s: %s", username, exc)
+
+
+def list_app_users() -> list[dict]:
+    """Return users without password hashes for admin management UI."""
+    from src.storage import AppUser, DatabaseManager
+    db = DatabaseManager.get_instance()
+    with db.get_session() as session:
+        users = session.query(AppUser).order_by(AppUser.created_at.desc(), AppUser.id.desc()).all()
+        return [
+            {
+                "id": user.id,
+                "username": user.username,
+                "role": user.role,
+                "status": user.status,
+                "created_at": user.created_at.isoformat() if user.created_at else None,
+                "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
+            }
+            for user in users
+        ]
+
+
+def update_app_user(user_id: int, *, role: Optional[str] = None, status: Optional[str] = None, password: Optional[str] = None) -> dict:
+    """Update a user account and return its public representation."""
+    from src.storage import AppUser, DatabaseManager
+    db = DatabaseManager.get_instance()
+    with db.get_session() as session:
+        user = session.query(AppUser).filter(AppUser.id == int(user_id)).first()
+        if not user:
+            raise ValueError("用户不存在")
+        if role is not None:
+            normalized_role = (role or "").strip().lower()
+            if normalized_role not in {"admin", "user"}:
+                raise ValueError("角色只能是 admin 或 user")
+            user.role = normalized_role
+        if status is not None:
+            normalized_status = (status or "").strip().lower()
+            if normalized_status not in {"active", "disabled"}:
+                raise ValueError("状态只能是 active 或 disabled")
+            user.status = normalized_status
+        if password is not None and str(password).strip():
+            _validate_account_password(str(password).strip())
+            user.password_hash = _hash_password(str(password).strip())
+        session.commit()
+        session.refresh(user)
+        return {
+            "id": user.id,
+            "username": user.username,
+            "role": user.role,
+            "status": user.status,
+            "created_at": user.created_at.isoformat() if user.created_at else None,
+            "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
+        }
+
 def set_initial_password(password: str) -> Optional[str]:
     """
     Set initial password (first-time setup). Returns error message or None on success.
@@ -329,43 +574,71 @@ def change_password(current: str, new: str) -> Optional[str]:
         return "密码保存失败"
 
 
-def create_session() -> str:
-    """Create a signed session payload. Format: nonce.ts.signature."""
+def create_session(user: Optional[dict] = None) -> str:
+    """Create a signed session payload. Format: nonce.ts.user_id.role.signature."""
     secret = _get_session_secret()
     if not secret:
         return ""
     nonce = secrets.token_urlsafe(32)
     ts = str(int(time.time()))
-    payload = f"{nonce}.{ts}"
+    if not user:
+        payload = f"{nonce}.{ts}"
+        sig = hmac.new(secret, payload.encode("utf-8"), hashlib.sha256).hexdigest()
+        return f"{payload}.{sig}"
+    user_id = str((user or {}).get("id", "0"))
+    role = str((user or {}).get("role", "admin"))
+    username = base64.urlsafe_b64encode(str((user or {}).get("username", "admin")).encode("utf-8")).decode("ascii").rstrip("=")
+    payload = f"{nonce}.{ts}.{user_id}.{role}.{username}"
     sig = hmac.new(secret, payload.encode("utf-8"), hashlib.sha256).hexdigest()
     return f"{payload}.{sig}"
 
 
-def verify_session(value: str) -> bool:
-    """Verify session cookie and check expiry."""
+def get_session_user(value: str) -> Optional[dict]:
+    """Verify session cookie and return user context."""
     secret = _get_session_secret()
     if not secret or not value:
-        return False
+        return None
+    value = (value or "").strip().strip('"')
     parts = value.split(".")
-    if len(parts) != 3:
-        return False
-    nonce, ts_str, sig = parts[0], parts[1], parts[2]
-    payload = f"{nonce}.{ts_str}"
+    if len(parts) == 3:
+        # Legacy admin-only cookie format.
+        nonce, ts_str, sig = parts[0], parts[1], parts[2]
+        payload = f"{nonce}.{ts_str}"
+        user_ctx = {"id": None, "username": "admin", "role": "admin"}
+    elif len(parts) == 6:
+        nonce, ts_str, user_id_str, role, username_b64, sig = parts
+        payload = f"{nonce}.{ts_str}.{user_id_str}.{role}.{username_b64}"
+        try:
+            padded_username = username_b64 + ("=" * (-len(username_b64) % 4))
+            username = base64.urlsafe_b64decode(padded_username.encode("ascii")).decode("utf-8")
+        except Exception:
+            username = ""
+        try:
+            user_id = int(user_id_str)
+        except ValueError:
+            user_id = None
+        user_ctx = {"id": user_id, "username": username, "role": role}
+    else:
+        return None
     expected = hmac.new(secret, payload.encode("utf-8"), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(sig, expected):
-        return False
+        return None
     try:
         ts = int(ts_str)
     except ValueError:
-        return False
+        return None
     try:
         max_age_hours = int(os.getenv("ADMIN_SESSION_MAX_AGE_HOURS", str(SESSION_MAX_AGE_HOURS_DEFAULT)))
     except ValueError:
         max_age_hours = SESSION_MAX_AGE_HOURS_DEFAULT
     if time.time() - ts > max_age_hours * 3600:
-        return False
-    return True
+        return None
+    return user_ctx
 
+
+def verify_session(value: str) -> bool:
+    """Verify session cookie and check expiry."""
+    return get_session_user(value) is not None
 
 def get_client_ip(request) -> str:
     """Get client IP, respecting TRUST_X_FORWARDED_FOR.

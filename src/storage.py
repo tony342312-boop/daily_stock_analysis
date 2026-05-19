@@ -148,6 +148,8 @@ class NewsIntel(Base):
 
     # 关联用户查询操作
     query_id = Column(String(64), index=True)
+    user_id = Column(Integer, ForeignKey('app_users.id'), nullable=True, index=True)
+    username = Column(String(64), nullable=True, index=True)
 
     # 股票信息
     code = Column(String(10), nullable=False, index=True)
@@ -209,6 +211,24 @@ class FundamentalSnapshot(Base):
         return f"<FundamentalSnapshot(query_id={self.query_id}, code={self.code})>"
 
 
+class AppUser(Base):
+    """Web application user account."""
+
+    __tablename__ = 'app_users'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    username = Column(String(64), nullable=False, unique=True, index=True)
+    password_hash = Column(Text, nullable=False)
+    role = Column(String(16), nullable=False, default='user', index=True)
+    status = Column(String(16), nullable=False, default='active', index=True)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    last_login_at = Column(DateTime)
+
+    __table_args__ = (
+        Index('ix_app_users_role_status', 'role', 'status'),
+    )
+
+
 class AnalysisHistory(Base):
     """
     分析结果历史记录模型
@@ -221,6 +241,8 @@ class AnalysisHistory(Base):
 
     # 关联查询链路
     query_id = Column(String(64), index=True)
+    user_id = Column(Integer, ForeignKey('app_users.id'), nullable=True, index=True)
+    username = Column(String(64), nullable=True, index=True)
 
     # 股票信息
     code = Column(String(10), nullable=False, index=True)
@@ -255,6 +277,8 @@ class AnalysisHistory(Base):
         return {
             'id': self.id,
             'query_id': self.query_id,
+            'user_id': self.user_id,
+            'username': self.username,
             'code': self.code,
             'name': self.name,
             'report_type': self.report_type,
@@ -691,6 +715,7 @@ class DatabaseManager:
         
         # 创建所有表
         Base.metadata.create_all(self._engine)
+        self._ensure_schema_migrations()
 
         self._initialized = True
         logger.info(f"数据库初始化完成: {db_url}")
@@ -730,6 +755,23 @@ class DatabaseManager:
                 logger.debug("数据库引擎已清理")
         except Exception as e:
             logger.warning(f"清理数据库引擎时出错: {e}")
+
+    def _ensure_schema_migrations(self) -> None:
+        """Apply lightweight SQLite migrations for columns added after initial deployment."""
+        if not self._is_sqlite_engine:
+            return
+        try:
+            with self._engine.begin() as conn:
+                rows = conn.exec_driver_sql("PRAGMA table_info(analysis_history)").fetchall()
+                columns = {row[1] for row in rows}
+                if 'user_id' not in columns:
+                    conn.exec_driver_sql("ALTER TABLE analysis_history ADD COLUMN user_id INTEGER")
+                if 'username' not in columns:
+                    conn.exec_driver_sql("ALTER TABLE analysis_history ADD COLUMN username VARCHAR(64)")
+                conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_analysis_history_user_id ON analysis_history(user_id)")
+                conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_analysis_history_username ON analysis_history(username)")
+        except Exception as exc:
+            logger.warning("SQLite schema migration failed: %s", exc)
 
     def _install_sqlite_pragma_handler(self) -> None:
         """为 SQLite 连接安装竞争保护参数。"""
@@ -1178,7 +1220,9 @@ class DatabaseManager:
         report_type: str,
         news_content: Optional[str],
         context_snapshot: Optional[Dict[str, Any]] = None,
-        save_snapshot: bool = True
+        save_snapshot: bool = True,
+        user_id: Optional[int] = None,
+        username: Optional[str] = None,
     ) -> int:
         """
         保存分析结果历史记录
@@ -1192,11 +1236,22 @@ class DatabaseManager:
         if save_snapshot and context_snapshot is not None:
             context_text = self._safe_json_dumps(context_snapshot)
 
+        if user_id is None or username is None:
+            try:
+                from src.auth import get_current_user_context
+                ctx_user = get_current_user_context() or {}
+                user_id = user_id if user_id is not None else ctx_user.get('id')
+                username = username if username is not None else ctx_user.get('username')
+            except Exception:
+                pass
+
         try:
             def _write(session: Session) -> int:
                 session.add(
                     AnalysisHistory(
                         query_id=query_id,
+                        user_id=user_id,
+                        username=username,
                         code=result.code,
                         name=result.name,
                         report_type=report_type,
@@ -1271,7 +1326,9 @@ class DatabaseManager:
         start_date: Optional[date] = None,
         end_date: Optional[date] = None,
         offset: int = 0,
-        limit: int = 20
+        limit: int = 20,
+        user_id: Optional[int] = None,
+        include_all_users: bool = False,
     ) -> Tuple[List[AnalysisHistory], int]:
         """
         分页查询分析历史记录（带总数）
@@ -1299,6 +1356,8 @@ class DatabaseManager:
             if end_date:
                 # created_at < end_date+1 00:00:00 (即 <= end_date 23:59:59)
                 conditions.append(AnalysisHistory.created_at < datetime.combine(end_date + timedelta(days=1), datetime.min.time()))
+            if user_id is not None and not include_all_users:
+                conditions.append(AnalysisHistory.user_id == user_id)
             
             # 构建 where 子句
             where_clause = and_(*conditions) if conditions else True
@@ -1319,6 +1378,26 @@ class DatabaseManager:
             
             return list(results), total
     
+    def delete_analysis_history_older_than(self, days: int = 14) -> int:
+        """Delete analysis history records older than the retention window."""
+        cutoff = datetime.now() - timedelta(days=max(1, int(days)))
+        def _write(session: Session) -> int:
+            old_ids = [
+                row[0]
+                for row in session.execute(
+                    select(AnalysisHistory.id).where(AnalysisHistory.created_at < cutoff)
+                ).all()
+            ]
+            if not old_ids:
+                return 0
+            try:
+                session.execute(delete(BacktestResult).where(BacktestResult.analysis_history_id.in_(old_ids)))
+            except Exception:
+                logger.debug("Skipping backtest cleanup", exc_info=True)
+            session.execute(delete(AnalysisHistory).where(AnalysisHistory.id.in_(old_ids)))
+            return len(old_ids)
+        return self._run_write_transaction("delete_analysis_history_older_than", _write)
+
     def get_analysis_history_by_id(self, record_id: int) -> Optional[AnalysisHistory]:
         """
         根据数据库主键 ID 查询单条分析历史记录

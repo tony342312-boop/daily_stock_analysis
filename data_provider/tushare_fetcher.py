@@ -187,13 +187,23 @@ class TushareFetcher(BaseFetcher):
         根据 Token 配置和 API 初始化状态确定优先级
 
         策略：
-        - Token 配置且 API 初始化成功：优先级 -1（绝对最高，优于 efinance）
+        - 显式配置 TUSHARE_PRIORITY 时尊重用户配置
+        - Token 配置且 API 初始化成功：默认优先级 -1（兼容旧行为）
         - 其他情况：优先级 2（默认）
 
         Returns:
             优先级数字（0=最高，数字越大优先级越低）
         """
         config = get_config()
+
+        priority_override = os.getenv("TUSHARE_PRIORITY")
+        if priority_override not in (None, ""):
+            try:
+                priority = int(priority_override)
+                logger.info("TUSHARE_PRIORITY 显式配置为 %s，按配置设置 Tushare 优先级", priority)
+                return priority
+            except ValueError:
+                logger.warning("TUSHARE_PRIORITY=%s 非法，忽略并使用默认优先级逻辑", priority_override)
 
         if config.tushare_token and self._api is not None:
             # Token 配置且 API 初始化成功，提升为最高优先级

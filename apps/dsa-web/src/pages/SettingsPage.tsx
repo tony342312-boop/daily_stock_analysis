@@ -6,9 +6,8 @@ import { systemConfigApi } from '../api/systemConfig';
 import { ApiErrorAlert, Button, ConfirmDialog, EmptyState } from '../components/common';
 import {
   AuthSettingsCard,
+  UserManagementCard,
   ChangePasswordCard,
-  IntelligentImport,
-  LLMChannelEditor,
   SettingsCategoryNav,
   SettingsAlert,
   SettingsField,
@@ -138,6 +137,19 @@ function formatDesktopEnvFilename() {
   return `dsa-desktop-env_${date}_${time}.env`;
 }
 
+
+const SETTINGS_HIDDEN_KEY_RE = /(^|_)(API(_?KEYS?)?|KEYS?|TOKEN|SECRET|PASSWORD|BASE_?URL|ENDPOINT|WEBHOOK|AUTHORIZATION)(_|$)/i;
+const SETTINGS_HIDDEN_PREFIX_RE = /^(LLM|LITELLM|OPENAI|DEEPSEEK|GEMINI|ANTHROPIC|AIHUBMIX|DASHSCOPE|ZHIPU|MOONSHOT|SILICONFLOW|OPENROUTER)_/i;
+
+function shouldHideSettingsItem(item: { key: string; schema?: { isSensitive?: boolean } }) {
+  const key = item.key.toUpperCase();
+  return Boolean(
+    item.schema?.isSensitive
+    || SETTINGS_HIDDEN_KEY_RE.test(key)
+    || SETTINGS_HIDDEN_PREFIX_RE.test(key)
+  );
+}
+
 const SettingsPage: React.FC = () => {
   const { passwordChangeable } = useAuth();
   const [desktopActionError, setDesktopActionError] = useState<ParsedApiError | null>(null);
@@ -168,7 +180,6 @@ const SettingsPage: React.FC = () => {
     activeCategory,
     setActiveCategory,
     hasDirty,
-    dirtyCount,
     toast,
     clearToast,
     isLoading,
@@ -178,12 +189,8 @@ const SettingsPage: React.FC = () => {
     retryAction,
     load,
     retry,
-    save,
-    resetDraft,
     setDraftValue,
-    refreshAfterExternalSave,
     configVersion,
-    maskToken,
   } = useSystemConfig();
 
   useEffect(() => {
@@ -249,60 +256,15 @@ const SettingsPage: React.FC = () => {
   }, [canCheckDesktopUpdate, desktopRuntimeApi]);
 
   const rawActiveItems = itemsByCategory[activeCategory] || [];
-  const rawActiveItemMap = new Map(rawActiveItems.map((item) => [item.key, String(item.value ?? '')]));
-  const hasConfiguredChannels = Boolean((rawActiveItemMap.get('LLM_CHANNELS') || '').trim());
-  const hasLitellmConfig = Boolean((rawActiveItemMap.get('LITELLM_CONFIG') || '').trim());
-
-  // Hide channel-managed and legacy provider-specific LLM keys from the
-  // generic form only when channel config is the active runtime source.
-  const LLM_CHANNEL_KEY_RE = /^LLM_[A-Z0-9]+_(PROTOCOL|BASE_URL|API_KEY|API_KEYS|MODELS|EXTRA_HEADERS|ENABLED)$/;
-  const AI_MODEL_HIDDEN_KEYS = new Set([
-    'LLM_CHANNELS',
-    'LLM_TEMPERATURE',
-    'LITELLM_MODEL',
-    'AGENT_LITELLM_MODEL',
-    'LITELLM_FALLBACK_MODELS',
-    'AIHUBMIX_KEY',
-    'DEEPSEEK_API_KEY',
-    'DEEPSEEK_API_KEYS',
-    'GEMINI_API_KEY',
-    'GEMINI_API_KEYS',
-    'GEMINI_MODEL',
-    'GEMINI_MODEL_FALLBACK',
-    'GEMINI_TEMPERATURE',
-    'ANTHROPIC_API_KEY',
-    'ANTHROPIC_API_KEYS',
-    'ANTHROPIC_MODEL',
-    'ANTHROPIC_TEMPERATURE',
-    'ANTHROPIC_MAX_TOKENS',
-    'OPENAI_API_KEY',
-    'OPENAI_API_KEYS',
-    'OPENAI_BASE_URL',
-    'OPENAI_MODEL',
-    'OPENAI_VISION_MODEL',
-    'OPENAI_TEMPERATURE',
-    'VISION_MODEL',
-  ]);
   const SYSTEM_HIDDEN_KEYS = new Set([
     'ADMIN_AUTH_ENABLED',
   ]);
-  const AGENT_HIDDEN_KEYS = new Set<string>();
-  const activeItems =
-    activeCategory === 'ai_model'
-      ? rawActiveItems.filter((item) => {
-        if (hasConfiguredChannels && LLM_CHANNEL_KEY_RE.test(item.key)) {
-          return false;
-        }
-        if (hasConfiguredChannels && !hasLitellmConfig && AI_MODEL_HIDDEN_KEYS.has(item.key)) {
-          return false;
-        }
-        return true;
-      })
-      : activeCategory === 'system'
-        ? rawActiveItems.filter((item) => !SYSTEM_HIDDEN_KEYS.has(item.key))
-      : activeCategory === 'agent'
-        ? rawActiveItems.filter((item) => !AGENT_HIDDEN_KEYS.has(item.key))
-      : rawActiveItems;
+  const activeItems = activeCategory === 'ai_model'
+    ? []
+    : rawActiveItems.filter((item) => (
+      !shouldHideSettingsItem(item)
+      && (activeCategory !== 'system' || !SYSTEM_HIDDEN_KEYS.has(item.key))
+    ));
   const desktopActionDisabled = isLoading || isSaving || isExportingEnv || isImportingEnv;
 
   const downloadDesktopEnv = async () => {
@@ -420,25 +382,8 @@ const SettingsPage: React.FC = () => {
             </p>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2">
-            <Button
-              type="button"
-              variant="settings-secondary"
-              onClick={resetDraft}
-              disabled={isLoading || isSaving}
-            >
-              重置
-            </Button>
-            <Button
-              type="button"
-              variant="settings-primary"
-              onClick={() => void save()}
-              disabled={!hasDirty || isSaving || isLoading}
-              isLoading={isSaving}
-              loadingText="保存中..."
-            >
-              {isSaving ? '保存中...' : `保存配置${dirtyCount ? ` (${dirtyCount})` : ''}`}
-            </Button>
+          <div className="rounded-full border settings-border bg-background/40 px-3 py-1.5 text-xs font-medium text-muted-text">
+            只读模式
           </div>
         </div>
 
@@ -476,6 +421,7 @@ const SettingsPage: React.FC = () => {
 
           <section className="space-y-4">
             {activeCategory === 'system' ? <AuthSettingsCard /> : null}
+            {activeCategory === 'system' ? <UserManagementCard /> : null}
             {activeCategory === 'system' ? (
               <SettingsSectionCard
                 title="版本信息"
@@ -619,38 +565,9 @@ const SettingsPage: React.FC = () => {
                 </div>
               </SettingsSectionCard>
             ) : null}
-            {activeCategory === 'base' ? (
-              <SettingsSectionCard
-                title="智能导入"
-                description="从图片、文件或剪贴板中提取股票代码，并合并到自选股列表。"
-              >
-                <IntelligentImport
-                  stockListValue={
-                    (activeItems.find((i) => i.key === 'STOCK_LIST')?.value as string) ?? ''
-                  }
-                  configVersion={configVersion}
-                  maskToken={maskToken}
-                  onMerged={async () => {
-                    await refreshAfterExternalSave(['STOCK_LIST']);
-                  }}
-                  disabled={isSaving || isLoading}
-                />
-              </SettingsSectionCard>
-            ) : null}
             {activeCategory === 'ai_model' ? (
-              <SettingsSectionCard
-                title="AI 模型接入"
-                description="统一管理模型渠道、基础地址、API Key、主模型与备选模型。"
-              >
-                <LLMChannelEditor
-                  items={rawActiveItems}
-                  configVersion={configVersion}
-                  maskToken={maskToken}
-                  onSaved={async (updatedItems) => {
-                    await refreshAfterExternalSave(updatedItems.map((item) => item.key));
-                  }}
-                  disabled={isSaving || isLoading}
-                />
+              <SettingsSectionCard title="AI 模型配置已隐藏">
+                <></>
               </SettingsSectionCard>
             ) : null}
             {activeCategory === 'system' && passwordChangeable ? (
@@ -666,7 +583,7 @@ const SettingsPage: React.FC = () => {
                     key={item.key}
                     item={item}
                     value={item.value}
-                    disabled={isSaving}
+                    disabled={true}
                     onChange={setDraftValue}
                     issues={issueByKey[item.key] || []}
                   />

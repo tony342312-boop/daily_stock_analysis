@@ -38,6 +38,22 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+
+
+def _ensure_web_config_write_enabled() -> None:
+    """Disable browser/web writes to server configuration unless explicitly enabled."""
+    if os.getenv("DSA_DESKTOP_MODE", "").strip().lower() == "true":
+        return
+    if os.getenv("DSA_WEB_CONFIG_WRITE_ENABLED", "").strip().lower() == "true":
+        return
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "error": "web_config_write_disabled",
+            "message": "Web configuration changes are disabled on this server",
+        },
+    )
+
 def _ensure_desktop_mode() -> None:
     """Restrict desktop backup/restore endpoints to desktop runtime only."""
     if os.getenv("DSA_DESKTOP_MODE", "").strip().lower() != "true":
@@ -86,6 +102,7 @@ def get_system_config(
     responses={
         200: {"description": "Configuration updated"},
         400: {"description": "Validation failed", "model": SystemConfigValidationErrorResponse},
+        403: {"description": "Web configuration writes disabled", "model": ErrorResponse},
         409: {"description": "Version conflict", "model": SystemConfigConflictResponse},
         500: {"description": "Internal server error", "model": ErrorResponse},
     },
@@ -97,6 +114,7 @@ def update_system_config(
     service: SystemConfigService = Depends(get_system_config_service),
 ) -> UpdateSystemConfigResponse:
     """Validate and persist system configuration updates."""
+    _ensure_web_config_write_enabled()
     try:
         payload = service.update(
             config_version=request.config_version,

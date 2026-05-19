@@ -111,7 +111,8 @@ class TestAnalyzerSchemaFallback(unittest.TestCase):
         result = analyzer._parse_response(response, "600519", "贵州茅台")
         self.assertIsInstance(result, AnalysisResult)
         self.assertEqual(result.code, "600519")
-        self.assertEqual(result.sentiment_score, 150)  # from raw dict
+        self.assertEqual(result.sentiment_score, 100)  # clamped into scorecard range
+        self.assertEqual(result.dashboard["scorecard"]["overall_score"], 100)
         self.assertTrue(result.success)
 
     def test_parse_response_valid_json_succeeds(self) -> None:
@@ -131,6 +132,39 @@ class TestAnalyzerSchemaFallback(unittest.TestCase):
         self.assertEqual(result.name, "贵州茅台")
         self.assertEqual(result.sentiment_score, 72)
         self.assertEqual(result.analysis_summary, "技术面向好")
+        self.assertEqual(result.dashboard["scorecard"]["overall_score"], 72)
+        self.assertEqual(len(result.dashboard["scorecard"]["dimensions"]), 5)
+
+    def test_parse_response_uses_weighted_scorecard_as_sentiment_score(self) -> None:
+        """New multi-dimensional scorecard should drive the top-level score."""
+        analyzer = GeminiAnalyzer()
+        response = json.dumps({
+            "stock_name": "测试公司",
+            "sentiment_score": 90,
+            "trend_prediction": "震荡",
+            "operation_advice": "观望",
+            "analysis_summary": "多维分歧，等待确认",
+            "dashboard": {
+                "core_conclusion": {"one_sentence": "基本面不错但估值和宏观压制，技术面需确认，暂时观望。"},
+                "scorecard": {
+                    "dimensions": {
+                        "technical": {"score": 40, "weight": 25, "evidence": "跌破均线"},
+                        "fundamental": {"score": 80, "weight": 25, "evidence": "利润和现金流改善"},
+                        "valuation": {"score": 45, "weight": 20, "evidence": "估值偏贵"},
+                        "news_sentiment": {"score": 60, "weight": 15, "evidence": "新闻中性偏正"},
+                        "macro_risk": {"score": 45, "weight": 15, "evidence": "利率压力"},
+                    }
+                },
+                "intelligence": {"risk_alerts": []},
+            },
+        })
+
+        result = analyzer._parse_response(response, "TEST", "测试公司")
+
+        self.assertEqual(result.sentiment_score, 55)
+        self.assertEqual(result.dashboard["scorecard"]["overall_score"], 55)
+        self.assertEqual(result.dashboard["scorecard"]["dimensions"]["fundamental"]["score"], 80)
+        self.assertIn("技术面25%", result.dashboard["scorecard"]["score_method"])
 
     def test_parse_text_response_honors_injected_runtime_report_language(self) -> None:
         """Fallback text parsing should use the analyzer's injected config, not the global singleton."""

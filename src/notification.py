@@ -15,6 +15,8 @@ A股自选股智能分析系统 - 通知层
    - Pushover（手机/桌面推送）
 """
 import logging
+import re
+import urllib.parse
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 from enum import Enum
@@ -609,6 +611,7 @@ class NotificationService(
                 ])
 
                 self._append_market_snapshot(report_lines, result)
+                self._append_technical_indicator_snapshot(report_lines, result)
                 
                 # 核心看点
                 if hasattr(result, 'key_points') and result.key_points:
@@ -880,6 +883,8 @@ class NotificationService(
                         report_lines.append("")
                         report_lines.append(f"**🚨 {labels['risk_alerts_label']}**:")
                         for alert in risk_alerts:
+                            if self._should_skip_display_item(alert):
+                                continue
                             report_lines.append(f"- {alert}")
                     # 利好催化
                     catalysts = intel.get('positive_catalysts', [])
@@ -893,6 +898,15 @@ class NotificationService(
                         report_lines.append("")
                         report_lines.append(f"**📢 {labels['latest_news_label']}**: {intel['latest_news']}")
                     report_lines.append("")
+
+                self._append_news_context_snapshot(report_lines, result)
+                self._append_filing_references(report_lines, result)
+                self._append_fundamental_snapshot(report_lines, result)
+                self._append_financial_statement_analysis(report_lines, result)
+                self._append_dividend_snapshot(report_lines, result)
+                self._append_peer_valuation_snapshot(report_lines, result)
+                self._append_macro_snapshot(report_lines, result)
+                self._append_integrated_research_framework(report_lines, result)
                 
                 # ========== 核心结论 ==========
                 core = dashboard.get('core_conclusion', {}) if dashboard else {}
@@ -921,6 +935,7 @@ class NotificationService(
                     ])
 
                 self._append_market_snapshot(report_lines, result)
+                self._append_technical_indicator_snapshot(report_lines, result)
                 
                 # ========== 数据透视 ==========
                 data_persp = dashboard.get('data_perspective', {}) if dashboard else {}
@@ -1017,6 +1032,8 @@ class NotificationService(
                             "",
                         ])
                         for item in checklist:
+                            if self._should_skip_display_item(item):
+                                continue
                             report_lines.append(f"- {item}")
                         report_lines.append("")
                 
@@ -1397,6 +1414,7 @@ class NotificationService(
         ]
 
         self._append_market_snapshot(lines, result)
+        self._append_technical_indicator_snapshot(lines, result)
         
         # 核心决策（一句话）
         one_sentence = core.get('one_sentence', result.analysis_summary) if core else result.analysis_summary
@@ -1534,6 +1552,1183 @@ class NotificationService(
             ])
 
         lines.append("")
+
+    def _append_technical_indicator_snapshot(self, lines: List[str], result: AnalysisResult) -> None:
+        snapshot = getattr(result, 'technical_indicator_snapshot', None)
+        if not snapshot:
+            return
+
+        def _num(key: str, digits: int = 2) -> str:
+            value = snapshot.get(key)
+            if value is None or value == "":
+                return "N/A"
+            try:
+                return f"{float(value):.{digits}f}"
+            except (TypeError, ValueError):
+                return str(value)
+
+        rows = [
+            ("EMA10", _num("ema10"), "短线趋势与动量"),
+            ("MA50", _num("ma50"), "中期趋势参考"),
+            ("MA200", _num("ma200"), "长期趋势/牛熊分界参考"),
+            ("Bollinger 中轨", _num("boll_mid"), "20日均值"),
+            ("Bollinger 上轨", _num("boll_upper"), "价格波动上沿"),
+            ("Bollinger 下轨", _num("boll_lower"), "价格波动下沿"),
+            ("ATR14", _num("atr14"), "近14日真实波幅"),
+            ("VWMA20", _num("vwma20"), "20日成交量加权均价"),
+            ("MFI14", _num("mfi14"), "资金流指标，0-100"),
+        ]
+
+        lines.extend([
+            "### 📐 扩展技术指标",
+            "",
+            "| 指标 | 数值 | 说明 |",
+            "|------|------|------|",
+        ])
+        for label, value, note in rows:
+            lines.append(f"| {label} | {value} | {note} |")
+
+        source = snapshot.get("source") or "StockTrendAnalyzer"
+        lines.extend([
+            "",
+            f"> 来源：{source}。这些指标用于补充趋势、波动率和资金流观察。",
+            "",
+        ])
+
+    def _append_news_context_snapshot(self, lines: List[str], result: AnalysisResult) -> None:
+        text = getattr(result, 'news_context_snapshot', None)
+        if not text:
+            return
+        text = str(text).strip()
+        if not text:
+            return
+
+        sections = self._parse_news_context_sections(text)
+        if sections:
+            lines.extend([
+                "### 🗞️ 搜索情报摘要",
+                "",
+                "> 这里展示每类搜索源命中的核心标题；长摘要和网页正文不再直接塞进报告，避免干扰阅读。",
+                "",
+                "| 模块 | 来源 | 核心命中 |",
+                "|------|------|----------|",
+            ])
+            for section in sections[:8]:
+                section_title = str(section.get("title") or "")
+                if self._should_skip_display_item(section_title):
+                    continue
+                items = section.get("items") or []
+                if not items:
+                    continue
+                item_text = "<br>".join(
+                    f"{idx + 1}. {self._sanitize_table_text(item)}"
+                    for idx, item in enumerate(items[:3])
+                )
+                lines.append(
+                    f"| {self._sanitize_table_text(section.get('title'))} | "
+                    f"{self._sanitize_table_text(section.get('source'))} | {item_text} |"
+                )
+            lines.append("")
+            return
+
+        max_chars = 1200
+        truncated = len(text) > max_chars
+        if truncated:
+            text = text[:max_chars].rstrip() + "\n... (已截断)"
+        text = self._clean_news_context_text(text).replace("```", "'''")
+
+        lines.extend([
+            "### 🗞️ 搜索情报摘要",
+            "",
+            "```text",
+            text,
+            "```",
+            "",
+        ])
+
+    @classmethod
+    def _parse_news_context_sections(cls, text: str) -> List[Dict[str, Any]]:
+        sections: List[Dict[str, Any]] = []
+        current: Optional[Dict[str, Any]] = None
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("【") and line.endswith("】"):
+                continue
+            header_match = re.match(r"^[^\w\s]?\s*(.+?)\s*\(来源:\s*([^)]+)\):$", line)
+            if header_match:
+                current = {
+                    "title": header_match.group(1).strip(),
+                    "source": header_match.group(2).strip(),
+                    "items": [],
+                }
+                sections.append(current)
+                continue
+            item_match = re.match(r"^\d+\.\s+(.+)$", line)
+            if not item_match:
+                item_match = re.match(r"^\s*\d+\.\s+(.+)$", raw_line)
+            if current is not None and item_match:
+                item = cls._clean_news_context_text(item_match.group(1))
+                if item:
+                    current["items"].append(item)
+        return [section for section in sections if section.get("items")]
+
+    @staticmethod
+    def _clean_news_context_text(text: str) -> str:
+        cleaned = str(text or "")
+        cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+        cleaned = cleaned.replace("&nbsp;", " ")
+        cleaned = cleaned.replace("[...]", "")
+        cleaned = cleaned.replace("#", "")
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+
+    @classmethod
+    def _sanitize_table_text(cls, value: Any, limit: int = 140) -> str:
+        text = cls._clean_news_context_text(str(value or "N/A")).replace("|", "\\|")
+        if len(text) > limit:
+            text = text[: limit - 1].rstrip() + "…"
+        return text
+
+    @staticmethod
+    def _should_skip_display_item(value: Any) -> bool:
+        text = str(value or "").lower()
+        skip_tokens = (
+            "sec form 144",
+            "form 144",
+            "sec 内部人",
+            "内部人交易",
+            "内部人申报",
+            "insider transaction",
+            "insider trading",
+            "insider filing",
+        )
+        return any(token in text for token in skip_tokens)
+
+    def _append_filing_references(self, lines: List[str], result: AnalysisResult) -> None:
+        refs = getattr(result, 'filing_references', None)
+        if not refs:
+            return
+
+        lines.extend([
+            "### 📄 财报原文链接",
+            "",
+            "| 类型 | 报告期 | 提交日期 | 链接 |",
+            "|------|--------|----------|------|",
+        ])
+        for ref in refs[:5]:
+            if not isinstance(ref, dict):
+                continue
+            links = self._build_sec_link_list(ref)
+            if not links:
+                continue
+            form = ref.get("form") or "SEC filing"
+            report_date = ref.get("report_date") or "N/A"
+            filing_date = ref.get("filing_date") or "N/A"
+            lines.append(f"| {form} | {report_date} | {filing_date} | {' / '.join(links)} |")
+        lines.extend([
+            "",
+            "> 链接优先使用 SEC Archives 原文直链；“详情”是 SEC filing package 页面，可作为备用入口。",
+            "",
+        ])
+
+    def _append_insider_activity_snapshot(self, lines: List[str], result: AnalysisResult) -> None:
+        snapshot = getattr(result, 'insider_activity_snapshot', None)
+        if not snapshot:
+            return
+        filings = snapshot.get("recent_filings")
+        if not isinstance(filings, list) or not filings:
+            return
+
+        lines.extend([
+            "### 🧾 SEC 内部人申报",
+            "",
+            "| 类型 | 报告期 | 提交日期 | 链接 |",
+            "|------|--------|----------|------|",
+        ])
+        for filing in filings[:6]:
+            if not isinstance(filing, dict):
+                continue
+            links = self._build_sec_link_list(filing)
+            if not links:
+                continue
+            lines.append(
+                f"| {filing.get('form', 'N/A')} | {filing.get('report_date', 'N/A')} | "
+                f"{filing.get('filing_date', 'N/A')} | {' / '.join(links)} |"
+            )
+        lines.extend([
+            "",
+            "> Form 4 通常用于内部人持股变动披露；买卖方向需进入 SEC 原文查看交易代码与数量。",
+            "",
+        ])
+
+    @classmethod
+    def _build_sec_link_list(cls, filing: Dict[str, Any]) -> List[str]:
+        candidates = [
+            ("PDF", filing.get("pdf_url")),
+            ("SEC 原文", filing.get("document_url") or filing.get("sec_url") or filing.get("url")),
+            ("详情", filing.get("filing_detail_url")),
+        ]
+        links: List[str] = []
+        seen = set()
+        for label, url in candidates:
+            normalized = cls._normalize_sec_archive_url(url)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            links.append(f"[{label}]({normalized})")
+        return links
+
+    @staticmethod
+    def _normalize_sec_archive_url(url: Any) -> str:
+        """Convert fragile SEC ixviewer URLs to direct Archives document URLs."""
+        text = str(url or "").strip()
+        if not text:
+            return ""
+        if "/ixviewer/doc/action" not in text or "doc=" not in text:
+            return text
+        parsed = urllib.parse.urlparse(text)
+        doc = urllib.parse.parse_qs(parsed.query).get("doc", [""])[0]
+        doc = urllib.parse.unquote(doc)
+        if doc.startswith("/Archives/"):
+            return f"https://www.sec.gov{doc}"
+        return text
+
+    def _append_fundamental_snapshot(self, lines: List[str], result: AnalysisResult) -> None:
+        snapshot = getattr(result, 'fundamental_snapshot', None)
+        if not snapshot:
+            return
+
+        def _value(key: str) -> str:
+            value = snapshot.get(key)
+            if value is None or value == "":
+                return "N/A"
+            return str(value)
+
+        source = _value("source")
+        lines.extend([
+            "### 📑 财报摘要",
+            "",
+            f"**最近报告**: {_value('form')}，报告期 {_value('report_date')}，提交日期 {_value('filing_date')}",
+            "",
+            "| 指标 | 数值 | 口径/说明 |",
+            "|------|------|-----------|",
+            f"| 营业收入 | {_value('revenue')} | {_value('revenue_period')} |",
+            f"| 归母净利润 | {_value('net_profit_parent')} | {_value('net_profit_parent_period')} |",
+            f"| 经营现金流 | {_value('operating_cash_flow')} | {_value('operating_cash_flow_period')} |",
+            f"| ROE | {_value('roe')} | {_value('roe_note')} |",
+            f"| 总资产 | {_value('assets')} | {source} |",
+            f"| 总负债 | {_value('liabilities')} | {source} / 资产-权益推算 |",
+            f"| 股东权益 | {_value('shareholders_equity')} | {source} |",
+            f"| 摊薄 EPS | {_value('eps_diluted')} | {source} |",
+            f"| 现金及可变现证券 | {_value('liquid_assets')} | 现金等价物 + 流动/非流动可交易证券 |",
+            f"| 有息债务 | {_value('interest_bearing_debt')} | 商业票据 + 长期债务当期/非当期部分 |",
+            f"| 净现金/净债务 | {_value('net_cash')} | 现金及可变现证券 - 有息债务 |",
+            "",
+        ])
+        self._append_financial_trend_tables(lines, snapshot)
+
+    def _append_financial_trend_tables(self, lines: List[str], snapshot: Dict[str, Any]) -> None:
+        quarterly = snapshot.get("quarterly_trend")
+        if isinstance(quarterly, list) and quarterly:
+            has_derived_row = any(isinstance(row, dict) and row.get("derived") for row in quarterly)
+            revenue_values = [row.get("revenue_value") for row in reversed(quarterly) if isinstance(row, dict)]
+            profit_values = [row.get("net_profit_parent_value") for row in reversed(quarterly) if isinstance(row, dict)]
+            margin_values = [row.get("net_margin_pct") for row in reversed(quarterly) if isinstance(row, dict)]
+            fcf_values = [row.get("free_cash_flow_value") for row in reversed(quarterly) if isinstance(row, dict)]
+
+            lines.extend([
+                "#### 最近季度财务趋势",
+                "",
+                "> 趋势图为迷你图，左旧右新；较前值表示相对前一披露季度/期间的变化，YoY 表示相对上一年同季。"
+                + ("带 * 的期间为累计值拆分或年报减 YTD 推算。" if has_derived_row else ""),
+                "",
+                "| 指标 | 趋势图 | 最新值 |",
+                "|------|--------|--------|",
+                f"| 收入 | {self._sparkline(revenue_values)} | {self._display_trend_latest(quarterly, 'revenue')} |",
+                f"| 净利润 | {self._sparkline(profit_values)} | {self._display_trend_latest(quarterly, 'net_profit_parent')} |",
+                f"| 净利率 | {self._sparkline(margin_values)} | {self._display_trend_latest_pct(quarterly, 'net_margin_pct')} |",
+                f"| 自由现金流 | {self._sparkline(fcf_values)} | {self._display_trend_latest(quarterly, 'free_cash_flow')} |",
+                "",
+                "| 期间 | 收入 | 较前值 | YoY | 净利润 | 较前值 | YoY | 净利率 | FCF | EPS |",
+                "|------|------|--------|-----|--------|--------|-----|--------|-----|-----|",
+            ])
+            for row in quarterly[:5]:
+                if not isinstance(row, dict):
+                    continue
+                period = str(row.get('period', 'N/A'))
+                if row.get("derived"):
+                    period = f"{period}*"
+                lines.append(
+                    f"| {period} | {row.get('revenue', 'N/A')} | "
+                    f"{self._format_change_pct(row.get('revenue_value_change_pct'))} | "
+                    f"{self._format_change_pct(row.get('revenue_value_yoy_pct'))} | "
+                    f"{row.get('net_profit_parent', 'N/A')} | "
+                    f"{self._format_change_pct(row.get('net_profit_parent_value_change_pct'))} | "
+                    f"{self._format_change_pct(row.get('net_profit_parent_value_yoy_pct'))} | "
+                    f"{self._fmt_pct(self._to_float(row.get('net_margin_pct')))} | "
+                    f"{row.get('free_cash_flow', 'N/A')} | {row.get('eps_diluted', 'N/A')} |"
+                )
+            lines.append("")
+
+        annual = snapshot.get("annual_trend")
+        if isinstance(annual, list) and annual:
+            lines.extend([
+                "#### 最近年度财务趋势",
+                "",
+                "| 年度 | 收入 | 较前值 | 净利润 | 较前值 | 净利率 | FCF |",
+                "|------|------|--------|--------|--------|--------|-----|",
+            ])
+            for row in annual[:4]:
+                if not isinstance(row, dict):
+                    continue
+                lines.append(
+                    f"| {row.get('period', 'N/A')} | {row.get('revenue', 'N/A')} | "
+                    f"{self._format_change_pct(row.get('revenue_value_change_pct'))} | "
+                    f"{row.get('net_profit_parent', 'N/A')} | "
+                    f"{self._format_change_pct(row.get('net_profit_parent_value_change_pct'))} | "
+                    f"{self._fmt_pct(self._to_float(row.get('net_margin_pct')))} | "
+                    f"{row.get('free_cash_flow', 'N/A')} |"
+                )
+            lines.append("")
+
+    def _append_financial_statement_analysis(self, lines: List[str], result: AnalysisResult) -> None:
+        snapshot = getattr(result, 'fundamental_snapshot', None)
+        if not snapshot:
+            return
+
+        dividend = getattr(result, 'dividend_snapshot', None) or {}
+        peer = getattr(result, 'peer_valuation_snapshot', None) or {}
+        insider = getattr(result, 'insider_activity_snapshot', None) or {}
+
+        revenue = self._financial_number(snapshot, "revenue_value", "revenue")
+        net_income = self._financial_number(snapshot, "net_profit_parent_value", "net_profit_parent")
+        ocf = self._financial_number(snapshot, "operating_cash_flow_value", "operating_cash_flow")
+        capex = self._financial_number(snapshot, "capital_expenditure_value", "capital_expenditure")
+        fcf = self._financial_number(snapshot, "free_cash_flow_value", "free_cash_flow")
+        assets = self._financial_number(snapshot, "assets_value", "assets")
+        liabilities = self._financial_number(snapshot, "liabilities_value", "liabilities")
+        equity = self._financial_number(snapshot, "shareholders_equity_value", "shareholders_equity")
+        liquid_assets = self._financial_number(snapshot, "liquid_assets_value", "liquid_assets")
+        interest_bearing_debt = self._financial_number(
+            snapshot,
+            "interest_bearing_debt_value",
+            "interest_bearing_debt",
+        )
+        net_cash = self._financial_number(snapshot, "net_cash_value", "net_cash")
+        if liabilities is None and assets is not None and equity is not None:
+            liabilities = assets - equity
+
+        net_margin = self._financial_pct(snapshot, "net_margin_pct", net_income, revenue)
+        ocf_to_ni = self._financial_pct(
+            snapshot,
+            "operating_cash_flow_to_net_income_pct",
+            ocf,
+            net_income,
+        )
+        fcf_to_ni = self._financial_pct(
+            snapshot,
+            "free_cash_flow_to_net_income_pct",
+            fcf,
+            net_income,
+        )
+        debt_to_assets = self._financial_pct(snapshot, "debt_to_assets_pct", liabilities, assets)
+        interest_bearing_debt_to_assets = self._financial_pct(
+            snapshot,
+            "interest_bearing_debt_to_assets_pct",
+            interest_bearing_debt,
+            assets,
+        )
+        liquid_assets_to_debt = self._financial_pct(
+            snapshot,
+            "liquid_assets_to_interest_bearing_debt_pct",
+            liquid_assets,
+            interest_bearing_debt,
+        )
+        equity_ratio = self._financial_pct(snapshot, "equity_ratio_pct", equity, assets)
+        roe = self._parse_percent(snapshot.get("roe"))
+
+        green_flags: List[str] = []
+        yellow_flags: List[str] = []
+
+        if net_margin is not None:
+            if net_margin >= 20:
+                green_flags.append(f"净利率约 {net_margin:.2f}%，盈利能力强")
+            elif net_margin < 8:
+                yellow_flags.append(f"净利率约 {net_margin:.2f}%，利润率偏低")
+        if roe is not None:
+            if roe >= 15:
+                green_flags.append(f"ROE 约 {roe:.2f}%，资本回报水平较高")
+            elif roe < 10:
+                yellow_flags.append(f"ROE 约 {roe:.2f}%，资本效率一般")
+        if ocf_to_ni is not None:
+            if ocf_to_ni >= 100:
+                green_flags.append(f"经营现金流/净利润约 {ocf_to_ni:.2f}%，利润现金含量强")
+            elif ocf_to_ni < 80:
+                yellow_flags.append(f"经营现金流/净利润约 {ocf_to_ni:.2f}%，需解释现金转化不足")
+        if fcf_to_ni is not None:
+            if fcf_to_ni >= 80:
+                green_flags.append(f"自由现金流/净利润约 {fcf_to_ni:.2f}%，可分配现金流质量较好")
+            elif fcf_to_ni < 50:
+                yellow_flags.append(f"自由现金流/净利润约 {fcf_to_ni:.2f}%，资本开支后现金留存偏弱")
+        elif capex is None:
+            yellow_flags.append("资本开支数据缺失，暂不能完整判断自由现金流质量")
+        if debt_to_assets is not None:
+            if debt_to_assets > 70:
+                yellow_flags.append(f"总负债率约 {debt_to_assets:.2f}%，但这不是有息债务率，需拆分经营性负债和债务")
+            elif debt_to_assets < 50:
+                green_flags.append(f"资产负债率约 {debt_to_assets:.2f}%，资产负债表较保守")
+        if interest_bearing_debt_to_assets is not None:
+            if interest_bearing_debt_to_assets < 30:
+                green_flags.append(f"有息债务/资产约 {interest_bearing_debt_to_assets:.2f}%，债务压力相对可控")
+            elif interest_bearing_debt_to_assets > 50:
+                yellow_flags.append(f"有息债务/资产约 {interest_bearing_debt_to_assets:.2f}%，需重点跟踪偿债压力")
+        if net_cash is not None and net_cash > 0:
+            green_flags.append(f"现金及可变现证券扣除有息债务后仍为净现金 {self._format_money_value(net_cash)}")
+
+        if isinstance(dividend, dict) and dividend.get("ttm_event_count") not in (None, "", "N/A", 0):
+            green_flags.append(f"近12个月有 {dividend.get('ttm_event_count')} 次现金分红，股东回报有持续性")
+
+        peer_summary = peer.get("summary") if isinstance(peer, dict) else None
+        if isinstance(peer_summary, dict):
+            pe_vs = peer_summary.get("pe_ratio_vs_peer_median_pct")
+            pb_vs = peer_summary.get("pb_ratio_vs_peer_median_pct")
+            try:
+                if pe_vs is not None and float(pe_vs) > 50:
+                    yellow_flags.append(f"PE 相对 peer 中位数溢价约 {float(pe_vs):.2f}%，估值已较充分")
+            except (TypeError, ValueError):
+                pass
+            try:
+                if pb_vs is not None and float(pb_vs) > 100:
+                    yellow_flags.append(f"PB 相对 peer 中位数溢价约 {float(pb_vs):.2f}%，需用品牌/生态/回购解释")
+            except (TypeError, ValueError):
+                pass
+
+        if not green_flags:
+            green_flags.append("暂无足够数据形成明确绿灯信号")
+        if not yellow_flags:
+            yellow_flags.append("暂未发现财报层面的明显红旗，仍需跟踪后续季度变化")
+
+        revenue_text = self._display_money(snapshot, 'revenue')
+        net_income_text = self._display_money(snapshot, 'net_profit_parent')
+        ocf_text = self._display_money(snapshot, 'operating_cash_flow')
+        fcf_text = self._format_money_value(fcf) if fcf is not None else self._display_money(snapshot, 'free_cash_flow')
+        assets_text = self._display_money(snapshot, 'assets')
+        liabilities_text = self._format_money_value(liabilities) if liabilities is not None else self._display_money(snapshot, 'liabilities')
+        liquid_assets_text = self._format_money_value(liquid_assets) if liquid_assets is not None else self._display_money(snapshot, 'liquid_assets')
+        interest_debt_text = self._format_money_value(interest_bearing_debt) if interest_bearing_debt is not None else self._display_money(snapshot, 'interest_bearing_debt')
+        net_cash_text = self._format_money_value(net_cash) if net_cash is not None else self._display_money(snapshot, 'net_cash')
+        dividend_yield = dividend.get('ttm_dividend_yield_pct', 'N/A')
+        if isinstance(dividend_yield, (int, float)):
+            dividend_yield = f"{float(dividend_yield):.4f}%"
+
+        lines.extend([
+            "### 🧮 财报分析",
+            "",
+            "> 方法论：结合科技股财报深挖的收入/盈利/现金流/资本配置模块、价值投资四维评分（ROE、债务安全、自由现金流质量、护城河）以及 SEC 对三张表和 MD&A 的阅读框架。",
+            "",
+            "| 分析维度 | 关键数据 | 解读 |",
+            "|----------|----------|------|",
+            f"| 收入与盈利质量 | 收入 {revenue_text}；净利润 {net_income_text}；净利率 {self._fmt_pct(net_margin)} | {self._profitability_comment(net_margin)} |",
+            f"| 现金流质量 | 经营现金流 {ocf_text}；OCF/净利润 {self._fmt_pct(ocf_to_ni)}；自由现金流 {fcf_text}；FCF/净利润 {self._fmt_pct(fcf_to_ni)} | {self._cash_quality_comment(ocf_to_ni, fcf_to_ni)} |",
+            f"| 资产负债表 | 总资产 {assets_text}；总负债 {liabilities_text}；总负债率 {self._fmt_pct(debt_to_assets)}；有息债务 {interest_debt_text}；有息债务/资产 {self._fmt_pct(interest_bearing_debt_to_assets)}；现金及可变现证券 {liquid_assets_text}；净现金/净债务 {net_cash_text} | {self._balance_sheet_comment(debt_to_assets, equity_ratio, interest_bearing_debt_to_assets, liquid_assets_to_debt, net_cash)} |",
+            f"| 资本效率 | ROE {snapshot.get('roe') or 'N/A'}；摊薄 EPS {snapshot.get('eps_diluted') or 'N/A'} | {self._roe_comment(roe)} |",
+            f"| 股东回报 | TTM 分红 {dividend.get('ttm_cash_dividend_per_share', 'N/A')}；股息率 {dividend_yield}；事件数 {dividend.get('ttm_event_count', 'N/A')} | 分红用于确认现金回报，但对成长/回购型公司不应单独作为估值锚。 |",
+            "",
+            "**绿灯信号**:",
+        ])
+        for item in green_flags[:6]:
+            lines.append(f"- {item}")
+        lines.append("")
+        lines.append("**红旗/黄旗**:")
+        for item in yellow_flags[:5]:
+            lines.append(f"- {item}")
+        lines.append("")
+
+    def _append_integrated_research_framework(self, lines: List[str], result: AnalysisResult) -> None:
+        snapshot = getattr(result, 'fundamental_snapshot', None) or {}
+        peer = getattr(result, 'peer_valuation_snapshot', None) or {}
+        macro = getattr(result, 'macro_snapshot', None) or {}
+        technical = getattr(result, 'technical_indicator_snapshot', None) or {}
+        if not any(isinstance(item, dict) and item for item in (snapshot, peer, macro, technical)):
+            return
+
+        framework = self._build_integrated_framework(snapshot, peer, macro, technical, result)
+        lines.extend([
+            "### 🧭 三框架综合诊断",
+            "",
+            "> 聚合方法：科技股财报深挖 + 美国价值投资四维 + 美国市场情绪/风险预算。这里先给研究框架和硬数据判断，不能替代个性化投资建议。",
+            "",
+            "#### 关键力量",
+            "",
+            "| 关键力量 | 当前证据 | 判断 | 后续观察 |",
+            "|----------|----------|------|----------|",
+        ])
+        for row in framework["key_forces"]:
+            lines.append(
+                f"| {row['force']} | {row['evidence']} | {row['judgement']} | {row['watch']} |"
+            )
+
+        lines.extend([
+            "",
+            "#### 价值投资四维评分",
+            "",
+            "| 维度 | 数据 | 得分 | 解读 |",
+            "|------|------|------|------|",
+        ])
+        for row in framework["value_scores"]:
+            lines.append(
+                f"| {row['dimension']} | {row['data']} | {row['score']} | {row['comment']} |"
+            )
+        lines.extend([
+            "",
+            f"**价值投资评级**: {framework['value_rating']}（{framework['value_total']} / 12）",
+            "",
+            "#### 市场情绪与风险预算",
+            "",
+            "| 模块 | 当前信号 | 风险含义 |",
+            "|------|----------|----------|",
+        ])
+        for row in framework["risk_budget_rows"]:
+            lines.append(f"| {row['module']} | {row['signal']} | {row['meaning']} |")
+        lines.extend([
+            "",
+            f"**风险预算倾向**: {framework['risk_budget']}。{framework['risk_budget_reason']}",
+            "",
+        ])
+
+    @staticmethod
+    def _display_money(snapshot: Dict[str, Any], key: str) -> str:
+        value = snapshot.get(key)
+        if value not in (None, ""):
+            return str(value)
+        value = snapshot.get(f"{key}_value")
+        if value is None:
+            return "N/A"
+        return NotificationService._format_money_value(value)
+
+    @staticmethod
+    def _format_money_value(value: Any) -> str:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return "N/A"
+        sign = "-" if number < 0 else ""
+        number = abs(number)
+        if number >= 1_000_000_000:
+            return f"{sign}${number / 1_000_000_000:.2f}B"
+        if number >= 1_000_000:
+            return f"{sign}${number / 1_000_000:.2f}M"
+        return f"{sign}${number:,.0f}"
+
+    @staticmethod
+    def _to_float(value: Any) -> Optional[float]:
+        try:
+            if value is None or value == "":
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _format_change_pct(value: Any) -> str:
+        number = NotificationService._to_float(value)
+        if number is None:
+            return "N/A"
+        arrow = "▲" if number > 0 else "▼" if number < 0 else "→"
+        return f"{arrow} {number:+.2f}%"
+
+    @staticmethod
+    def _sparkline(values: List[Any]) -> str:
+        numbers = [NotificationService._to_float(value) for value in values]
+        clean = [value for value in numbers if value is not None]
+        if len(clean) < 2:
+            return "N/A"
+        low = min(clean)
+        high = max(clean)
+        chars = "▁▂▃▄▅▆▇█"
+        if high == low:
+            return chars[len(chars) // 2] * len(clean)
+        points = []
+        for value in clean:
+            idx = int(round((value - low) / (high - low) * (len(chars) - 1)))
+            points.append(chars[max(0, min(idx, len(chars) - 1))])
+        return "".join(points)
+
+    @staticmethod
+    def _display_trend_latest(rows: List[Dict[str, Any]], key: str) -> str:
+        if not rows:
+            return "N/A"
+        value = rows[0].get(key)
+        if value not in (None, ""):
+            return str(value)
+        raw = rows[0].get(f"{key}_value")
+        return NotificationService._format_money_value(raw) if raw is not None else "N/A"
+
+    @staticmethod
+    def _display_trend_latest_pct(rows: List[Dict[str, Any]], key: str) -> str:
+        if not rows:
+            return "N/A"
+        return NotificationService._fmt_pct(NotificationService._to_float(rows[0].get(key)))
+
+    def _build_integrated_framework(
+        self,
+        snapshot: Dict[str, Any],
+        peer: Dict[str, Any],
+        macro: Dict[str, Any],
+        technical: Dict[str, Any],
+        result: AnalysisResult,
+    ) -> Dict[str, Any]:
+        latest_trend = None
+        quarterly = snapshot.get("quarterly_trend")
+        if isinstance(quarterly, list) and quarterly:
+            latest_trend = quarterly[0] if isinstance(quarterly[0], dict) else None
+
+        revenue_change = latest_trend.get("revenue_value_change_pct") if latest_trend else None
+        profit_change = latest_trend.get("net_profit_parent_value_change_pct") if latest_trend else None
+        net_margin = self._financial_pct(
+            snapshot,
+            "net_margin_pct",
+            self._financial_number(snapshot, "net_profit_parent_value", "net_profit_parent"),
+            self._financial_number(snapshot, "revenue_value", "revenue"),
+        )
+        roe = self._parse_percent(snapshot.get("roe"))
+        debt_to_assets = self._financial_pct(
+            snapshot,
+            "debt_to_assets_pct",
+            self._financial_number(snapshot, "liabilities_value", "liabilities"),
+            self._financial_number(snapshot, "assets_value", "assets"),
+        )
+        interest_debt_to_assets = self._financial_pct(
+            snapshot,
+            "interest_bearing_debt_to_assets_pct",
+            self._financial_number(snapshot, "interest_bearing_debt_value", "interest_bearing_debt"),
+            self._financial_number(snapshot, "assets_value", "assets"),
+        )
+        liquid_assets_to_debt = self._financial_pct(
+            snapshot,
+            "liquid_assets_to_interest_bearing_debt_pct",
+            self._financial_number(snapshot, "liquid_assets_value", "liquid_assets"),
+            self._financial_number(snapshot, "interest_bearing_debt_value", "interest_bearing_debt"),
+        )
+        net_cash = self._financial_number(snapshot, "net_cash_value", "net_cash")
+        ocf_to_ni = self._financial_pct(
+            snapshot,
+            "operating_cash_flow_to_net_income_pct",
+            self._financial_number(snapshot, "operating_cash_flow_value", "operating_cash_flow"),
+            self._financial_number(snapshot, "net_profit_parent_value", "net_profit_parent"),
+        )
+        fcf_to_ni = self._financial_pct(
+            snapshot,
+            "free_cash_flow_to_net_income_pct",
+            self._financial_number(snapshot, "free_cash_flow_value", "free_cash_flow"),
+            self._financial_number(snapshot, "net_profit_parent_value", "net_profit_parent"),
+        )
+
+        peer_summary = peer.get("summary") if isinstance(peer, dict) else {}
+        pe_vs = self._to_float((peer_summary or {}).get("pe_ratio_vs_peer_median_pct"))
+        pb_vs = self._to_float((peer_summary or {}).get("pb_ratio_vs_peer_median_pct"))
+
+        key_forces = [
+            {
+                "force": "收入与利润动能",
+                "evidence": (
+                    f"收入较前值 {self._format_change_pct(revenue_change)}；"
+                    f"净利润较前值 {self._format_change_pct(profit_change)}；"
+                    f"净利率 {self._fmt_pct(net_margin)}"
+                ),
+                "judgement": self._growth_force_comment(revenue_change, profit_change, net_margin),
+                "watch": "下一季收入增速、净利率和管理层指引是否同向改善",
+            },
+            {
+                "force": "利润现金含量",
+                "evidence": f"OCF/净利润 {self._fmt_pct(ocf_to_ni)}；FCF/净利润 {self._fmt_pct(fcf_to_ni)}",
+                "judgement": self._cash_quality_comment(ocf_to_ni, fcf_to_ni),
+                "watch": "经营现金流、CapEx、库存/应收变化和回购资金来源",
+            },
+            {
+                "force": "估值隐含预期",
+                "evidence": f"PE 相对 peer {self._fmt_pct(pe_vs)}；PB 相对 peer {self._fmt_pct(pb_vs)}",
+                "judgement": self._valuation_force_comment(pe_vs, pb_vs),
+                "watch": "增长兑现速度是否足以支撑相对估值溢价",
+            },
+        ]
+
+        value_scores = [
+            self._score_value_dimension(
+                "ROE 可持续性",
+                f"ROE {snapshot.get('roe') or 'N/A'}",
+                self._score_roe(roe),
+                self._roe_comment(roe),
+            ),
+            self._score_value_dimension(
+                "债务安全性",
+                f"有息债务/资产 {self._fmt_pct(interest_debt_to_assets)}；总负债/资产 {self._fmt_pct(debt_to_assets)}；净现金/净债务 {self._format_money_value(net_cash) if net_cash is not None else 'N/A'}",
+                self._score_debt_safety(interest_debt_to_assets if interest_debt_to_assets is not None else debt_to_assets),
+                self._balance_sheet_comment(
+                    debt_to_assets,
+                    None,
+                    interest_debt_to_assets,
+                    liquid_assets_to_debt,
+                    net_cash,
+                ),
+            ),
+            self._score_value_dimension(
+                "自由现金流质量",
+                f"FCF/净利润 {self._fmt_pct(fcf_to_ni)}；OCF/净利润 {self._fmt_pct(ocf_to_ni)}",
+                self._score_cash_quality(fcf_to_ni, ocf_to_ni),
+                self._cash_quality_comment(ocf_to_ni, fcf_to_ni),
+            ),
+            self._score_value_dimension(
+                "经济护城河初判",
+                f"净利率 {self._fmt_pct(net_margin)}；ROE {self._fmt_pct(roe)}；相对估值溢价 {self._fmt_pct(pe_vs)}",
+                self._score_moat_proxy(net_margin, roe, pe_vs),
+                "这是财务代理指标，仍需结合品牌、网络效应、转换成本和竞争格局验证。",
+            ),
+        ]
+        value_total = sum(row["_score_raw"] for row in value_scores)
+        value_rating = self._value_rating(value_total)
+        for row in value_scores:
+            row.pop("_score_raw", None)
+
+        risk_budget_rows, risk_points = self._risk_budget_rows(macro, technical, peer_summary)
+        if risk_points >= 3:
+            risk_budget = "降低/控制"
+            risk_reason = "估值、利率或技术热度中已有多项脆弱性信号，适合小仓或等待更好赔率。"
+        elif risk_points <= 1:
+            risk_budget = "可维持/适度提高"
+            risk_reason = "宏观和技术风险信号不拥挤，但仍要以个股基本面和止损为主。"
+        else:
+            risk_budget = "维持"
+            risk_reason = "机会和风险较均衡，更适合分批和条件触发式操作。"
+
+        return {
+            "key_forces": key_forces,
+            "value_scores": value_scores,
+            "value_total": value_total,
+            "value_rating": value_rating,
+            "risk_budget_rows": risk_budget_rows,
+            "risk_budget": risk_budget,
+            "risk_budget_reason": risk_reason,
+        }
+
+    @staticmethod
+    def _score_value_dimension(dimension: str, data: str, score: int, comment: str) -> Dict[str, Any]:
+        return {
+            "dimension": dimension,
+            "data": data,
+            "score": f"{score}/3",
+            "comment": comment,
+            "_score_raw": score,
+        }
+
+    @staticmethod
+    def _score_roe(roe: Optional[float]) -> int:
+        if roe is None:
+            return 0
+        if roe > 20:
+            return 3
+        if roe > 15:
+            return 2
+        if roe >= 10:
+            return 1
+        return 0
+
+    @staticmethod
+    def _score_debt_safety(debt_to_assets: Optional[float]) -> int:
+        if debt_to_assets is None:
+            return 0
+        if debt_to_assets < 30:
+            return 3
+        if debt_to_assets < 50:
+            return 2
+        if debt_to_assets <= 70:
+            return 1
+        return 0
+
+    @staticmethod
+    def _score_cash_quality(fcf_to_ni: Optional[float], ocf_to_ni: Optional[float]) -> int:
+        primary = fcf_to_ni if fcf_to_ni is not None else ocf_to_ni
+        if primary is None:
+            return 0
+        if primary >= 100:
+            return 3
+        if primary >= 80:
+            return 2
+        if primary >= 50:
+            return 1
+        return 0
+
+    @staticmethod
+    def _score_moat_proxy(net_margin: Optional[float], roe: Optional[float], pe_vs: Optional[float]) -> int:
+        score = 0
+        if net_margin is not None and net_margin >= 20:
+            score += 1
+        if roe is not None and roe >= 20:
+            score += 1
+        if pe_vs is not None and pe_vs > 20:
+            score += 1
+        return min(score, 3)
+
+    @staticmethod
+    def _value_rating(total: int) -> str:
+        if total >= 10:
+            return "A 级，高质量长期候选"
+        if total >= 7:
+            return "B 级，质量较好但需看估值和买点"
+        if total >= 4:
+            return "C 级，存在明显短板"
+        return "D 级，价值投资框架下需谨慎"
+
+    @staticmethod
+    def _growth_force_comment(
+        revenue_change: Optional[float],
+        profit_change: Optional[float],
+        net_margin: Optional[float],
+    ) -> str:
+        if revenue_change is None and profit_change is None:
+            return "趋势数据不足，先看最新财报绝对质量。"
+        if (revenue_change or 0) > 0 and (profit_change or 0) > 0:
+            return "收入和利润同向改善，财报动能较好。"
+        if (revenue_change or 0) > 0 and (profit_change or 0) < 0:
+            return "收入增长但利润承压，需要检查成本、费用或一次性项目。"
+        if net_margin is not None and net_margin >= 20:
+            return "增速一般但利润率仍高，偏成熟现金牛特征。"
+        return "增长动能偏弱，需要等待收入或利润重新加速。"
+
+    @staticmethod
+    def _valuation_force_comment(pe_vs: Optional[float], pb_vs: Optional[float]) -> str:
+        if pe_vs is None and pb_vs is None:
+            return "估值对比数据不足。"
+        if (pe_vs is not None and pe_vs > 50) or (pb_vs is not None and pb_vs > 100):
+            return "相对估值溢价较高，市场已经给了较强预期。"
+        if pe_vs is not None and pe_vs < -20:
+            return "相对 peer 有折价，需判断是机会还是基本面折价。"
+        return "相对估值未到极端区间，需结合增长质量判断。"
+
+    def _risk_budget_rows(
+        self,
+        macro: Dict[str, Any],
+        technical: Dict[str, Any],
+        peer_summary: Dict[str, Any],
+    ) -> Tuple[List[Dict[str, str]], int]:
+        risk_points = 0
+        ten_yield = self._macro_indicator_value(macro, ("10Y Treasury Yield",))
+        cpi = self._macro_indicator_value(macro, ("CPI YoY", "CPI"))
+        mfi = self._to_float(technical.get("mfi14") or technical.get("MFI14"))
+        pe_vs = self._to_float((peer_summary or {}).get("pe_ratio_vs_peer_median_pct"))
+
+        rows: List[Dict[str, str]] = []
+        if ten_yield is not None:
+            high = ten_yield >= 4.25
+            risk_points += 1 if high else 0
+            rows.append({
+                "module": "利率/折现率",
+                "signal": f"10Y 美债 {ten_yield:.2f}%",
+                "meaning": "高估值资产折现率压力偏大" if high else "利率压力相对可控",
+            })
+        if cpi is not None:
+            high = cpi >= 3.0
+            risk_points += 1 if high else 0
+            rows.append({
+                "module": "通胀",
+                "signal": f"CPI YoY {cpi:.2f}%",
+                "meaning": "通胀仍偏粘性，降息预期容易反复" if high else "通胀压力相对缓和",
+            })
+        if pe_vs is not None:
+            high = pe_vs > 50
+            risk_points += 1 if high else 0
+            rows.append({
+                "module": "估值拥挤",
+                "signal": f"PE 相对 peer {pe_vs:+.2f}%",
+                "meaning": "估值已反映较多乐观预期" if high else "相对估值没有显著过热",
+            })
+        if mfi is not None:
+            high = mfi >= 80
+            warm = mfi >= 70
+            risk_points += 1 if high else 0
+            rows.append({
+                "module": "技术热度",
+                "signal": f"MFI14 {mfi:.2f}",
+                "meaning": "资金流过热，追高风险较大" if high else "资金流偏热，适合等回踩" if warm else "资金流未明显过热",
+            })
+        if not rows:
+            rows.append({
+                "module": "数据质量",
+                "signal": "宏观/技术风险数据不足",
+                "meaning": "暂以个股财报和价格纪律为主",
+            })
+        return rows, risk_points
+
+    @staticmethod
+    def _macro_indicator_value(macro: Dict[str, Any], labels: Tuple[str, ...]) -> Optional[float]:
+        indicators = macro.get("indicators") if isinstance(macro, dict) else None
+        if not isinstance(indicators, list):
+            return None
+        for item in indicators:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label") or item.get("series_id") or "")
+            if any(token in label for token in labels):
+                return NotificationService._to_float(item.get("value"))
+        return None
+
+    @classmethod
+    def _financial_number(cls, snapshot: Dict[str, Any], value_key: str, display_key: str) -> Optional[float]:
+        value = snapshot.get(value_key)
+        if value not in (None, ""):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                pass
+        return cls._parse_money(snapshot.get(display_key))
+
+    @staticmethod
+    def _parse_money(value: Any) -> Optional[float]:
+        text = str(value or "").strip()
+        if not text or text.upper() in {"N/A", "NA", "NONE"}:
+            return None
+        multiplier = 1.0
+        upper = text.upper()
+        if "B" in upper:
+            multiplier = 1_000_000_000.0
+        elif "M" in upper:
+            multiplier = 1_000_000.0
+        negative = text.startswith("-") or ("(" in text and ")" in text)
+        cleaned = (
+            text.replace("$", "")
+            .replace(",", "")
+            .replace("B", "")
+            .replace("b", "")
+            .replace("M", "")
+            .replace("m", "")
+            .replace("(", "")
+            .replace(")", "")
+            .strip()
+        )
+        try:
+            number = float(cleaned) * multiplier
+        except (TypeError, ValueError):
+            return None
+        return -number if negative else number
+
+    @staticmethod
+    def _parse_percent(value: Any) -> Optional[float]:
+        if value in (None, ""):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).replace("%", "").strip()
+        if not text or text.upper() in {"N/A", "NA", "NONE"}:
+            return None
+        try:
+            return float(text)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _financial_pct(
+        cls,
+        snapshot: Dict[str, Any],
+        pct_key: str,
+        numerator: Optional[float],
+        denominator: Optional[float],
+    ) -> Optional[float]:
+        explicit = cls._parse_percent(snapshot.get(pct_key))
+        if explicit is not None:
+            return explicit
+        if numerator is None or denominator in (None, 0):
+            return None
+        try:
+            return round(float(numerator) / float(denominator) * 100.0, 2)
+        except (TypeError, ValueError, ZeroDivisionError):
+            return None
+
+    @staticmethod
+    def _fmt_pct(value: Optional[float]) -> str:
+        return "N/A" if value is None else f"{float(value):.2f}%"
+
+    @staticmethod
+    def _profitability_comment(net_margin: Optional[float]) -> str:
+        if net_margin is None:
+            return "利润率数据不足，暂不能判断收入转化为利润的效率。"
+        if net_margin >= 20:
+            return "净利率处于高水平，说明品牌、生态或规模效率较强。"
+        if net_margin >= 10:
+            return "净利率尚可，但需要与同业和历史趋势比较。"
+        return "净利率偏低，需关注成本、价格竞争或一次性费用压力。"
+
+    @staticmethod
+    def _cash_quality_comment(ocf_to_ni: Optional[float], fcf_to_ni: Optional[float]) -> str:
+        if ocf_to_ni is None and fcf_to_ni is None:
+            return "现金流数据不足，无法判断利润含金量。"
+        if ocf_to_ni is not None and ocf_to_ni >= 100 and (fcf_to_ni is None or fcf_to_ni >= 80):
+            return "利润向现金转化较强，是财报质量的核心正面信号。"
+        if ocf_to_ni is not None and ocf_to_ni < 80:
+            return "经营现金流低于净利润，需要检查应收、库存、递延收入或一次性项目。"
+        if fcf_to_ni is not None and fcf_to_ni < 50:
+            return "资本开支后自由现金流偏弱，需要判断投资是否能形成未来增长。"
+        return "现金流质量总体可接受，但仍需结合连续季度趋势确认。"
+
+    @staticmethod
+    def _balance_sheet_comment(
+        debt_to_assets: Optional[float],
+        equity_ratio: Optional[float],
+        interest_bearing_debt_to_assets: Optional[float] = None,
+        liquid_assets_to_debt: Optional[float] = None,
+        net_cash: Optional[float] = None,
+    ) -> str:
+        if debt_to_assets is None and equity_ratio is None:
+            return "资产负债表数据不足，暂不能判断杠杆安全性。"
+        if net_cash is not None and net_cash > 0 and (
+            interest_bearing_debt_to_assets is None or interest_bearing_debt_to_assets < 30
+        ):
+            return "总负债率较高，但有息债务率不高且净现金为正，债务安全性不能按总负债率简单判差。"
+        if liquid_assets_to_debt is not None and liquid_assets_to_debt >= 100:
+            return "可变现资产能覆盖有息债务，需关注的是回购导致的低权益基数，而非短期偿债压力。"
+        if debt_to_assets is not None and debt_to_assets > 70:
+            return "总负债率偏高，回购型公司需特别区分经营性负债、有息债务和低权益基数效应。"
+        if debt_to_assets is not None and debt_to_assets < 50:
+            return "资产负债表相对保守，抗冲击能力较好。"
+        return "杠杆处于中等区间，需结合现金流和利率环境观察。"
+
+    @staticmethod
+    def _roe_comment(roe: Optional[float]) -> str:
+        if roe is None:
+            return "ROE 数据不足，不能判断资本效率。"
+        if roe >= 20:
+            return "ROE 较高，但若公司长期回购导致权益偏低，需要同步看利润增长和现金流。"
+        if roe >= 15:
+            return "ROE 良好，资本使用效率较强。"
+        if roe >= 10:
+            return "ROE 一般，需观察是否具备持续改善空间。"
+        return "ROE 偏低，价值投资视角需要谨慎。"
+
+    def _append_macro_snapshot(self, lines: List[str], result: AnalysisResult) -> None:
+        snapshot = getattr(result, 'macro_snapshot', None)
+        if not snapshot:
+            return
+        indicators = snapshot.get("indicators")
+        if not isinstance(indicators, list) or not indicators:
+            return
+
+        lines.extend([
+            "### 🌐 FRED 宏观指标",
+            "",
+            "| 指标 | 数值 | 日期 | 说明 |",
+            "|------|------|------|------|",
+        ])
+        for item in indicators:
+            if not isinstance(item, dict):
+                continue
+            label = item.get("label") or item.get("series_id") or "N/A"
+            value = item.get("value")
+            unit = item.get("unit") or ""
+            date = item.get("date") or "N/A"
+            note = item.get("note") or ""
+            value_text = "N/A" if value is None or value == "" else f"{value}{unit}"
+            lines.append(f"| {label} | {value_text} | {date} | {note} |")
+        lines.append("")
+
+    def _append_dividend_snapshot(self, lines: List[str], result: AnalysisResult) -> None:
+        snapshot = getattr(result, 'dividend_snapshot', None)
+        if not snapshot:
+            return
+
+        def _value(key: str) -> str:
+            value = snapshot.get(key)
+            if value is None or value == "":
+                return "N/A"
+            if key == "ttm_dividend_yield_pct" and isinstance(value, (int, float)):
+                return f"{float(value):.4f}%"
+            return str(value)
+
+        lines.extend([
+            "### 💵 分红指标",
+            "",
+            "| 指标 | 数值 | 来源/说明 |",
+            "|------|------|-----------|",
+            f"| 近12个月每股现金分红 | {_value('ttm_cash_dividend_per_share')} | 仅现金分红、税前口径 |",
+            f"| TTM 股息率 | {_value('ttm_dividend_yield_pct')} | 近12个月每股现金分红 / 当前价格 |",
+            f"| TTM 分红事件数 | {_value('ttm_event_count')} | {_value('source')} |",
+            f"| 最近分红事实 | {_value('latest_dividend_fact')} | {_value('source')} |",
+            "",
+        ])
+
+        events = snapshot.get("events")
+        if isinstance(events, list) and events:
+            lines.extend([
+                "| 除息/事件日期 | 每股现金分红 |",
+                "|--------------|--------------|",
+            ])
+            for event in events[:4]:
+                if not isinstance(event, dict):
+                    continue
+                lines.append(
+                    f"| {event.get('event_date', 'N/A')} | {event.get('cash_dividend_per_share', 'N/A')} |"
+                )
+            lines.append("")
+
+    def _append_peer_valuation_snapshot(self, lines: List[str], result: AnalysisResult) -> None:
+        snapshot = getattr(result, 'peer_valuation_snapshot', None)
+        if not snapshot:
+            return
+        rows = snapshot.get("rows")
+        if not isinstance(rows, list) or not rows:
+            return
+
+        def _num(value: Any, digits: int = 2) -> str:
+            if value is None or value == "":
+                return "N/A"
+            try:
+                return f"{float(value):.{digits}f}"
+            except (TypeError, ValueError):
+                return str(value)
+
+        lines.extend([
+            "### 🧭 同类型估值对比",
+            "",
+        ])
+        basis = snapshot.get("comparison_basis")
+        if basis:
+            lines.extend([f"> 对比口径：{basis}", ""])
+        lines.extend([
+            "| 公司 | 当前价 | PE | PB | 市值 |",
+            "|------|--------|----|----|------|",
+        ])
+        for row in rows[:6]:
+            if not isinstance(row, dict):
+                continue
+            label = f"{row.get('symbol', 'N/A')} {row.get('name', '')}".strip()
+            if row.get("is_target"):
+                label = f"**{label}**"
+            lines.append(
+                f"| {label} | {_num(row.get('price'))} | {_num(row.get('pe_ratio'))} | "
+                f"{_num(row.get('pb_ratio'))} | {row.get('market_cap_text') or 'N/A'} |"
+            )
+
+        summary = snapshot.get("summary")
+        if isinstance(summary, dict) and summary:
+            pe_vs = summary.get("pe_ratio_vs_peer_median_pct")
+            pb_vs = summary.get("pb_ratio_vs_peer_median_pct")
+            pe_vs_text = "N/A" if pe_vs is None else f"{float(pe_vs):.2f}%"
+            pb_vs_text = "N/A" if pb_vs is None else f"{float(pb_vs):.2f}%"
+            lines.extend([
+                "",
+                "| 对比项 | 数值 |",
+                "|--------|------|",
+                f"| Peer PE 中位数 | {_num(summary.get('peer_median_pe_ratio'))} |",
+                f"| Peer PB 中位数 | {_num(summary.get('peer_median_pb_ratio'))} |",
+                f"| 标的 PE 相对中位数 | {pe_vs_text} |",
+                f"| 标的 PB 相对中位数 | {pb_vs_text} |",
+            ])
+        source = snapshot.get("source") or snapshot.get("provider") or "realtime_quote"
+        lines.extend([
+            "",
+            f"> 来源：{source}。该表用于相对估值参考，不能替代增长率、利润质量和业务结构判断。",
+            "",
+        ])
 
     def _should_use_image_for_channel(
         self, channel: NotificationChannel, image_bytes: Optional[bytes]

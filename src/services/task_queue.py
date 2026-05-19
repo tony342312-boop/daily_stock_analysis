@@ -71,6 +71,7 @@ class TaskInfo:
     completed_at: Optional[datetime] = None
     original_query: Optional[str] = None
     selection_source: Optional[str] = None
+    user_context: Optional[Dict[str, Any]] = None
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert task info into an API-friendly dictionary."""
@@ -88,6 +89,7 @@ class TaskInfo:
             "error": self.error,
             "original_query": self.original_query,
             "selection_source": self.selection_source,
+            "user_context": self.user_context,
         }
     
     def copy(self) -> 'TaskInfo':
@@ -107,6 +109,7 @@ class TaskInfo:
             completed_at=self.completed_at,
             original_query=self.original_query,
             selection_source=self.selection_source,
+            user_context=self.user_context.copy() if isinstance(self.user_context, dict) else self.user_context,
         )
 
 
@@ -300,6 +303,7 @@ class AnalysisTaskQueue:
         selection_source: Optional[str] = None,
         report_type: str = "detailed",
         force_refresh: bool = False,
+        user_context: Optional[Dict[str, Any]] = None,
     ) -> TaskInfo:
         """
         Submit a single analysis task.
@@ -318,7 +322,7 @@ class AnalysisTaskQueue:
         Raises:
             DuplicateTaskError: Raised when the stock is already being analyzed
         """
-        stock_code = canonical_stock_code(stock_code)
+        stock_code = canonical_stock_code(normalize_stock_code(stock_code))
         if not stock_code:
             raise ValueError("股票代码不能为空或仅包含空白字符")
 
@@ -329,6 +333,7 @@ class AnalysisTaskQueue:
             selection_source=selection_source,
             report_type=report_type,
             force_refresh=force_refresh,
+            user_context=user_context,
         )
         if duplicates:
             raise duplicates[0]
@@ -343,6 +348,7 @@ class AnalysisTaskQueue:
         report_type: str = "detailed",
         force_refresh: bool = False,
         notify: bool = True,
+        user_context: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[TaskInfo], List[DuplicateTaskError]]:
         """
         Submit analysis tasks in batch.
@@ -356,17 +362,18 @@ class AnalysisTaskQueue:
         duplicates: List[DuplicateTaskError] = []
         created_task_ids: List[str] = []
 
-        canonical_codes = [
-            normalized for normalized in (canonical_stock_code(code) for code in stock_codes)
-            if normalized
-        ]
+        canonical_pairs: List[Tuple[str, str]] = []
+        for code in stock_codes:
+            normalized = canonical_stock_code(normalize_stock_code(code))
+            if normalized:
+                canonical_pairs.append((canonical_stock_code(code), normalized))
 
         with self._data_lock:
-            for stock_code in canonical_codes:
+            for submitted_code, stock_code in canonical_pairs:
                 dedupe_key = _dedupe_stock_code_key(stock_code)
                 if dedupe_key in self._analyzing_stocks:
                     existing_task_id = self._analyzing_stocks[dedupe_key]
-                    duplicates.append(DuplicateTaskError(stock_code, existing_task_id))
+                    duplicates.append(DuplicateTaskError(submitted_code, existing_task_id))
                     continue
 
                 task_id = uuid.uuid4().hex
@@ -379,6 +386,7 @@ class AnalysisTaskQueue:
                     report_type=report_type,
                     original_query=original_query,
                     selection_source=selection_source,
+                    user_context=user_context.copy() if isinstance(user_context, dict) else user_context,
                 )
                 self._tasks[task_id] = task_info
                 self._analyzing_stocks[dedupe_key] = task_id
@@ -391,6 +399,7 @@ class AnalysisTaskQueue:
                         report_type,
                         force_refresh,
                         notify,
+                        user_context,
                     )
                 except Exception:
                     # Roll back the current batch to avoid partial submission.
@@ -532,6 +541,7 @@ class AnalysisTaskQueue:
         report_type: str,
         force_refresh: bool,
         notify: bool = True,
+        user_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         执行分析任务（在线程池中运行）
@@ -567,14 +577,19 @@ class AnalysisTaskQueue:
             def _on_progress(progress: int, message: str) -> None:
                 self.update_task_progress(task_id, progress, message)
 
-            result = service.analyze_stock(
-                stock_code=stock_code,
-                report_type=report_type,
-                force_refresh=force_refresh,
-                query_id=task_id,
-                send_notification=notify,
-                progress_callback=_on_progress,
-            )
+            from src.auth import reset_current_user_context, set_current_user_context
+            token = set_current_user_context(user_context)
+            try:
+                result = service.analyze_stock(
+                    stock_code=stock_code,
+                    report_type=report_type,
+                    force_refresh=force_refresh,
+                    query_id=task_id,
+                    send_notification=notify,
+                    progress_callback=_on_progress,
+                )
+            finally:
+                reset_current_user_context(token)
             
             if result:
                 # 更新任务状态为完成

@@ -1,10 +1,11 @@
 import type React from 'react';
+import { useState } from 'react';
 import type {
   ReportDetails as ReportDetailsType,
   ReportMeta,
   ReportSummary as ReportSummaryType,
 } from '../../types/analysis';
-import { Badge, Card, ScoreGauge } from '../common';
+import { Badge, Card, Drawer, ScoreGauge } from '../common';
 import { formatDateTime } from '../../utils/format';
 import { getReportText, normalizeReportLanguage } from '../../utils/reportLanguage';
 
@@ -20,6 +21,31 @@ type BoardStatus = 'leading' | 'lagging';
 type BoardSignal = {
   status: BoardStatus;
   changePct?: number;
+};
+
+type UnknownRecord = Record<string, unknown>;
+
+type ScoreDimension = {
+  key: string;
+  label: string;
+  score: number;
+  weight?: number;
+  evidence?: string;
+};
+
+const isRecord = (value: unknown): value is UnknownRecord => (
+  typeof value === 'object' && value !== null && !Array.isArray(value)
+);
+
+const pickValue = (record: UnknownRecord | undefined, ...keys: string[]): unknown => {
+  if (!record) return undefined;
+  for (const key of keys) {
+    const value = record[key];
+    if (value !== undefined && value !== null && value !== '') {
+      return value;
+    }
+  }
+  return undefined;
 };
 
 const normalizeBoardName = (value?: string): string =>
@@ -70,6 +96,45 @@ const buildBoardSignalMap = (details?: ReportDetailsType): Map<string, BoardSign
   return signalMap;
 };
 
+const SCORE_DIMENSION_ORDER: Array<[string, string, string]> = [
+  ['technical', 'technical', '技术面'],
+  ['fundamental', 'fundamental', '基本面'],
+  ['valuation', 'valuation', '估值'],
+  ['newsSentiment', 'news_sentiment', '新闻/情绪'],
+  ['macroRisk', 'macro_risk', '宏观/风险'],
+];
+
+const getDashboardRecord = (details?: ReportDetailsType): UnknownRecord | undefined => {
+  const rawResult = isRecord(details?.rawResult) ? details?.rawResult : undefined;
+  const dashboard = pickValue(rawResult, 'dashboard');
+  return isRecord(dashboard) ? dashboard : undefined;
+};
+
+const getScorecardRecord = (details?: ReportDetailsType): UnknownRecord | undefined => {
+  const dashboard = getDashboardRecord(details);
+  const scorecard = pickValue(dashboard, 'scorecard');
+  return isRecord(scorecard) ? scorecard : undefined;
+};
+
+const getScoreDimensions = (details?: ReportDetailsType): ScoreDimension[] => {
+  const scorecard = getScorecardRecord(details);
+  const dimensions = pickValue(scorecard, 'dimensions');
+  const dimensionRecord = isRecord(dimensions) ? dimensions : undefined;
+  return SCORE_DIMENSION_ORDER.flatMap(([camelKey, snakeKey, fallbackLabel]) => {
+    const rawDimension = pickValue(dimensionRecord, camelKey, snakeKey);
+    if (!isRecord(rawDimension)) return [];
+    const score = coerceFiniteNumber(pickValue(rawDimension, 'score'));
+    if (score === undefined) return [];
+    return [{
+      key: camelKey,
+      label: String(pickValue(rawDimension, 'label') || fallbackLabel),
+      score: Math.max(0, Math.min(100, score)),
+      weight: coerceFiniteNumber(pickValue(rawDimension, 'weight')),
+      evidence: String(pickValue(rawDimension, 'evidence') || ''),
+    }];
+  });
+};
+
 /**
  * 报告概览区组件 - 终端风格
  */
@@ -84,6 +149,15 @@ export const ReportOverview: React.FC<ReportOverviewProps> = ({
     .filter((board) => normalizeBoardName(board?.name).length > 0)
     .slice(0, 3);
   const boardSignals = buildBoardSignalMap(details);
+  const scorecard = getScorecardRecord(details);
+  const scoreDimensions = getScoreDimensions(details);
+  const scorecardOverall = coerceFiniteNumber(pickValue(scorecard, 'overallScore', 'overall_score'));
+  const overallScore = scorecardOverall ?? summary.sentimentScore;
+  const [activeScoreDimension, setActiveScoreDimension] = useState<ScoreDimension | null>(null);
+  const scorecardFallbackNote = reportLanguage === 'en'
+    ? 'This older report has no saved dimension breakdown. Re-run the analysis to show technical, fundamental, valuation, news, and macro scores.'
+    : '这条历史报告未保存维度拆分；重新分析后会显示技术面、基本面、估值、新闻/情绪、宏观/风险分项。';
+  const scoreDimensionHint = reportLanguage === 'en' ? 'Click to expand' : '点击展开';
 
   const getPriceChangeStyle = (changePct: number | undefined): React.CSSProperties | undefined => {
     if (changePct === undefined || changePct === null) {
@@ -122,6 +196,7 @@ export const ReportOverview: React.FC<ReportOverviewProps> = ({
   };
 
   return (
+    <>
     <div className="space-y-5">
       {/* 主信息区 - 两列布局，items-stretch 确保右侧与左侧同高 */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-5 items-stretch">
@@ -267,16 +342,93 @@ export const ReportOverview: React.FC<ReportOverviewProps> = ({
           )}
         </div>
 
-        {/* 右侧：情绪指标 - 填满格子高度，消除与 STRATEGY POINTS 之间的空隙 */}
+        {/* 右侧：综合评分 - 填满格子高度，消除与 STRATEGY POINTS 之间的空隙 */}
         <div className="flex flex-col self-stretch min-h-full">
           <Card variant="bordered" padding="md" className="home-panel-card home-rail-card !overflow-visible flex-1 flex flex-col min-h-0">
-            <div className="text-center flex-1 flex flex-col justify-center">
-              <h3 className="mb-5 text-sm font-medium tracking-wide text-foreground">{text.marketSentiment}</h3>
-              <ScoreGauge score={summary.sentimentScore} size="lg" language={reportLanguage} />
+            <div className="flex flex-1 flex-col justify-center">
+              <div className="text-center">
+                <h3 className="mb-5 text-sm font-medium tracking-wide text-foreground">
+                  {text.overallScore}
+                </h3>
+                <ScoreGauge score={overallScore} size="lg" language={reportLanguage} />
+              </div>
+              {scoreDimensions.length > 0 && (
+                <div className="mt-5 space-y-2.5 text-left">
+                  <div className="label-uppercase text-muted-text">{text.scoreBreakdown}</div>
+                  {scoreDimensions.map((dimension) => (
+                    <button
+                      key={dimension.key}
+                      type="button"
+                      onClick={() => setActiveScoreDimension(dimension)}
+                      className="w-full rounded-md bg-white/5 px-2.5 py-2 text-left transition-colors hover:bg-white/10 focus:outline-none focus:ring-2 focus:ring-cyan/50"
+                      aria-label={`${dimension.label} ${scoreDimensionHint}`}
+                    >
+                      <div className="mb-1.5 flex items-center justify-between gap-2 text-xs">
+                        <span className="font-medium text-secondary-text">{dimension.label}</span>
+                        <span className="font-mono text-foreground">
+                          {Math.round(dimension.score)}
+                          {dimension.weight !== undefined ? <span className="text-muted-text"> · {dimension.weight}%</span> : null}
+                        </span>
+                      </div>
+                      <div className="h-1.5 overflow-hidden rounded-full bg-white/10">
+                        <div
+                          className="h-full rounded-full bg-cyan transition-[width] duration-500"
+                          style={{ width: `${dimension.score}%` }}
+                        />
+                      </div>
+                      {dimension.evidence ? (
+                        <p className="mt-1.5 line-clamp-2 text-[11px] leading-4 text-muted-text">
+                          {dimension.evidence}
+                        </p>
+                      ) : null}
+                      <span className="mt-1.5 inline-flex text-[10px] text-cyan/80">{scoreDimensionHint}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+              {scoreDimensions.length === 0 && (
+                <p className="mx-auto mt-4 max-w-[24ch] text-center text-xs leading-5 text-muted-text">
+                  {scorecardFallbackNote}
+                </p>
+              )}
             </div>
           </Card>
         </div>
       </div>
     </div>
+    <Drawer
+      isOpen={activeScoreDimension !== null}
+      onClose={() => setActiveScoreDimension(null)}
+      title={activeScoreDimension?.label || text.scoreBreakdown}
+      width="max-w-xl"
+      zIndex={70}
+    >
+      {activeScoreDimension ? (
+        <div className="space-y-5 text-left">
+          <div className="rounded-lg border border-border/70 bg-white/5 p-4">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <span className="text-sm font-medium text-secondary-text">{activeScoreDimension.label}</span>
+              <span className="font-mono text-xl font-semibold text-foreground">
+                {Math.round(activeScoreDimension.score)}
+                {activeScoreDimension.weight !== undefined ? <span className="ml-2 text-sm text-muted-text">/ {activeScoreDimension.weight}%</span> : null}
+              </span>
+            </div>
+            <div className="h-2 overflow-hidden rounded-full bg-white/10">
+              <div
+                className="h-full rounded-full bg-cyan"
+                style={{ width: `${activeScoreDimension.score}%` }}
+              />
+            </div>
+          </div>
+          <div>
+            <div className="label-uppercase mb-2 text-muted-text">{reportLanguage === 'en' ? 'Evidence' : '评分依据'}</div>
+            <p className="whitespace-pre-wrap text-sm leading-7 text-secondary-text">
+              {activeScoreDimension.evidence || (reportLanguage === 'en' ? 'No evidence text available.' : '暂无详细依据。')}
+            </p>
+          </div>
+        </div>
+      ) : null}
+    </Drawer>
+    </>
   );
 };

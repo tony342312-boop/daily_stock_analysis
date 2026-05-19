@@ -10,9 +10,12 @@
 """
 
 import logging
+import os
+import re
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query, Depends, Body
+from fastapi import APIRouter, HTTPException, Query, Depends, Body, Request
+from fastapi.responses import Response
 
 from api.deps import get_database_manager
 from api.v1.schemas.history import (
@@ -61,11 +64,14 @@ router = APIRouter()
     description="分页获取历史分析记录摘要，支持按股票代码和日期范围筛选"
 )
 def get_history_list(
+    request: Request,
     stock_code: Optional[str] = Query(None, description="股票代码筛选"),
     start_date: Optional[str] = Query(None, description="开始日期 (YYYY-MM-DD)"),
     end_date: Optional[str] = Query(None, description="结束日期 (YYYY-MM-DD)"),
     page: int = Query(1, ge=1, description="页码（从 1 开始）"),
     limit: int = Query(20, ge=1, le=100, description="每页数量"),
+    user_id: Optional[int] = Query(None, description="管理员按用户筛选"),
+    all_users: bool = Query(False, alias="allUsers", description="管理员查看全部用户记录"),
     db_manager: DatabaseManager = Depends(get_database_manager)
 ) -> HistoryListResponse:
     """
@@ -86,6 +92,10 @@ def get_history_list(
     """
     try:
         service = HistoryService(db_manager)
+        current_user = getattr(request.state, "current_user", None) or {}
+        is_admin = current_user.get("role") == "admin"
+        effective_user_id = user_id if is_admin and user_id is not None else current_user.get("id")
+        include_all = bool(is_admin and all_users)
         
         # 使用 def 而非 async def，FastAPI 自动在线程池中执行
         result = service.get_history_list(
@@ -93,7 +103,9 @@ def get_history_list(
             start_date=start_date,
             end_date=end_date,
             page=page,
-            limit=limit
+            limit=limit,
+            user_id=effective_user_id,
+            include_all_users=include_all,
         )
         
         # 转换为响应模型
@@ -106,16 +118,25 @@ def get_history_list(
                 report_type=item.get("report_type"),
                 sentiment_score=item.get("sentiment_score"),
                 operation_advice=item.get("operation_advice"),
-                created_at=item.get("created_at")
+                created_at=item.get("created_at"),
+                user_id=item.get("user_id"),
+                username=item.get("username"),
             )
             for item in result.get("items", [])
         ]
         
+        try:
+            retention_days = int(os.getenv("HISTORY_RETENTION_DAYS", "14"))
+        except ValueError:
+            retention_days = 14
+        auto_cleanup_enabled = os.getenv("HISTORY_AUTO_CLEANUP_ENABLED", "true").strip().lower() in {"true", "1", "yes", "on"}
         return HistoryListResponse(
             total=result.get("total", 0),
             page=page,
             limit=limit,
-            items=items
+            items=items,
+            retention_days=retention_days,
+            auto_cleanup_enabled=auto_cleanup_enabled,
         )
         
     except Exception as e:
@@ -187,6 +208,7 @@ def delete_history_records(
 )
 def get_history_detail(
     record_id: str,
+    request: Request,
     db_manager: DatabaseManager = Depends(get_database_manager)
 ) -> AnalysisReport:
     """
@@ -218,6 +240,12 @@ def get_history_detail(
                     "error": "not_found",
                     "message": f"未找到 id/query_id={record_id} 的分析记录"
                 }
+            )
+        current_user = getattr(request.state, "current_user", None) or {}
+        if current_user.get("role") != "admin" and result.get("user_id") != current_user.get("id"):
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "not_found", "message": f"未找到 id/query_id={record_id} 的分析记录"},
             )
         
         # 从 context_snapshot 中提取价格信息
@@ -466,3 +494,61 @@ def get_history_markdown(
         )
 
     return MarkdownReportResponse(content=markdown_content)
+
+
+@router.get(
+    "/{record_id}/pdf",
+    responses={
+        200: {"description": "PDF 格式报告", "content": {"application/pdf": {}}},
+        404: {"description": "报告不存在", "model": ErrorResponse},
+        500: {"description": "服务器错误", "model": ErrorResponse},
+    },
+    summary="下载历史报告 PDF",
+    description="根据分析历史记录 ID 生成并下载 PDF 格式的完整分析报告"
+)
+def get_history_pdf(
+    record_id: str,
+    db_manager: DatabaseManager = Depends(get_database_manager)
+) -> Response:
+    service = HistoryService(db_manager)
+
+    try:
+        pdf_content = service.get_pdf_report(record_id)
+    except MarkdownReportGenerationError as e:
+        logger.error(f"PDF report generation failed for {record_id}: {e.message}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "generation_failed",
+                "message": f"生成 PDF 报告失败: {e.message}"
+            }
+        )
+    except Exception as e:
+        logger.error(f"获取 PDF 报告失败: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "internal_error",
+                "message": f"获取 PDF 报告失败: {str(e)}"
+            }
+        )
+
+    if pdf_content is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "not_found",
+                "message": f"未找到 id/query_id={record_id} 的分析记录"
+            }
+        )
+
+    filename_id = re.sub(r"[^0-9A-Za-z_-]+", "_", str(record_id)).strip("_") or "report"
+    filename = f"analysis_report_{filename_id}.pdf"
+    return Response(
+        content=pdf_content,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )

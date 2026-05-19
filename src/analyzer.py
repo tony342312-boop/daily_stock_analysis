@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import time
+import urllib.parse
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple, Callable
 
@@ -48,6 +49,45 @@ from src.schemas.report_schema import AnalysisReportSchema
 from src.market_context import get_market_role, get_market_guidelines
 
 logger = logging.getLogger(__name__)
+
+SCORECARD_DIMENSIONS: Tuple[Tuple[str, str, int], ...] = (
+    ("technical", "技术面", 25),
+    ("fundamental", "基本面", 25),
+    ("valuation", "估值", 20),
+    ("news_sentiment", "新闻/情绪", 15),
+    ("macro_risk", "宏观/风险", 15),
+)
+
+_SCORECARD_EN_LABELS: Dict[str, str] = {
+    "technical": "Technicals",
+    "fundamental": "Fundamentals",
+    "valuation": "Valuation",
+    "news_sentiment": "News/Sentiment",
+    "macro_risk": "Macro/Risk",
+}
+
+_SCORECARD_TEXT_HINTS: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {
+    "technical": (
+        ("多头", "突破", "放量", "缩量企稳", "趋势向上", "金叉", "站上", "bullish", "breakout", "uptrend"),
+        ("空头", "跌破", "破位", "放量下跌", "超买", "乖离", "overbought", "breakdown", "bearish"),
+    ),
+    "fundamental": (
+        ("增长", "改善", "强劲", "盈利", "现金流", "ROE", "利润率", "上调", "growth", "profit", "cash flow"),
+        ("下滑", "亏损", "承压", "恶化", "放缓", "缺失", "衰退", "loss", "decline", "pressure"),
+    ),
+    "valuation": (
+        ("低估", "合理", "折价", "便宜", "安全边际", "undervalued", "discount", "reasonable"),
+        ("高估", "偏贵", "估值过高", "溢价", "透支", "expensive", "premium", "overvalued"),
+    ),
+    "news_sentiment": (
+        ("利好", "催化", "上调", "买入评级", "订单", "positive", "upgrade", "catalyst"),
+        ("利空", "减持", "诉讼", "调查", "下调", "负面", "negative", "downgrade", "lawsuit"),
+    ),
+    "macro_risk": (
+        ("顺风", "降息", "流动性改善", "需求复苏", "tailwind", "rate cut", "demand recovery"),
+        ("逆风", "利率压力", "通胀", "衰退", "监管", "出口管制", "headwind", "inflation", "recession"),
+    ),
+}
 
 
 class _LiteLLMStreamError(RuntimeError):
@@ -125,6 +165,209 @@ def apply_placeholder_fill(result: "AnalysisResult", missing_fields: List[str]) 
             if "sniper_points" not in result.dashboard["battle_plan"]:
                 result.dashboard["battle_plan"]["sniper_points"] = {}
             result.dashboard["battle_plan"]["sniper_points"]["stop_loss"] = placeholder
+
+
+def _scorecard_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+    if value is None or value == "":
+        return default
+    if isinstance(value, str):
+        value = value.strip().replace("分", "").replace("%", "")
+    try:
+        number = int(round(float(value)))
+    except (TypeError, ValueError):
+        return default
+    return max(0, min(100, number))
+
+
+def _scorecard_label(key: str, default_label: str, report_language: str) -> str:
+    if normalize_report_language(report_language) == "en":
+        return _SCORECARD_EN_LABELS.get(key, default_label)
+    return default_label
+
+
+def _scorecard_text_delta(key: str, text: str) -> int:
+    if not text:
+        return 0
+    lowered = text.lower()
+    positive_terms, negative_terms = _SCORECARD_TEXT_HINTS.get(key, ((), ()))
+    positive_hits = sum(1 for term in positive_terms if term.lower() in lowered)
+    negative_hits = sum(1 for term in negative_terms if term.lower() in lowered)
+    return max(-15, min(15, (positive_hits - negative_hits) * 4))
+
+
+def _scorecard_dimension_text(payload: Dict[str, Any], dashboard: Dict[str, Any], key: str) -> str:
+    top_level_keys = {
+        "technical": ("technical_analysis", "ma_analysis", "volume_analysis", "pattern_analysis", "trend_analysis"),
+        "fundamental": ("fundamental_analysis", "company_highlights", "sector_position"),
+        "valuation": ("valuation_analysis", "fundamental_analysis", "risk_warning"),
+        "news_sentiment": ("news_summary", "market_sentiment", "hot_topics", "risk_warning"),
+        "macro_risk": ("market_sentiment", "risk_warning", "analysis_summary"),
+    }.get(key, ())
+    parts: List[str] = []
+    for field in top_level_keys:
+        value = payload.get(field)
+        if value:
+            parts.append(str(value))
+
+    nested_keys = {
+        "technical": ("data_perspective",),
+        "fundamental": ("intelligence",),
+        "valuation": ("core_conclusion",),
+        "news_sentiment": ("intelligence",),
+        "macro_risk": ("intelligence",),
+    }.get(key, ())
+    for field in nested_keys:
+        value = dashboard.get(field)
+        if value:
+            try:
+                parts.append(json.dumps(value, ensure_ascii=False, default=str))
+            except TypeError:
+                parts.append(str(value))
+    return "\n".join(parts)
+
+
+def ensure_dashboard_scorecard_payload(
+    payload: Dict[str, Any],
+    report_language: str = "zh",
+) -> Optional[int]:
+    """Ensure dashboard.scorecard exists, then normalize and return the weighted score.
+
+    LLM and Agent paths do not always honor the expanded schema.  This helper
+    creates a transparent fallback scorecard from the legacy score and available
+    dimension-specific text so the WebUI has a stable multi-dimensional shape.
+    """
+    normalized_score = normalize_dashboard_scorecard_payload(payload, report_language)
+    dashboard = payload.get("dashboard") if isinstance(payload, dict) else None
+    if not isinstance(dashboard, dict):
+        if not isinstance(payload, dict):
+            return normalized_score
+        dashboard = {}
+        payload["dashboard"] = dashboard
+
+    scorecard = dashboard.get("scorecard")
+    if not isinstance(scorecard, dict):
+        scorecard = {}
+        dashboard["scorecard"] = scorecard
+
+    raw_dimensions = scorecard.get("dimensions")
+    dimensions = raw_dimensions if isinstance(raw_dimensions, dict) else {}
+    if normalized_score is not None and len(dimensions) >= len(SCORECARD_DIMENSIONS):
+        return normalized_score
+    has_model_dimension = any(
+        isinstance(dimensions.get(key), dict)
+        and _scorecard_int(dimensions[key].get("score")) is not None
+        for key, _, _ in SCORECARD_DIMENSIONS
+    )
+
+    base_score = _scorecard_int(scorecard.get("overall_score"), None)
+    if base_score is None:
+        base_score = _scorecard_int(payload.get("sentiment_score"), 50)
+    if base_score is None:
+        base_score = 50
+
+    synthesized_dimensions: Dict[str, Dict[str, Any]] = dict(dimensions)
+    for key, default_label, default_weight in SCORECARD_DIMENSIONS:
+        raw_dimension = synthesized_dimensions.get(key)
+        if isinstance(raw_dimension, dict) and _scorecard_int(raw_dimension.get("score")) is not None:
+            continue
+
+        dimension_text = _scorecard_dimension_text(payload, dashboard, key)
+        score_seed = base_score + _scorecard_text_delta(key, dimension_text) if has_model_dimension else base_score
+        score = _scorecard_int(score_seed, base_score)
+        if normalize_report_language(report_language) == "en":
+            evidence = (
+                "Synthesized from available report text because the model did not return this dimension score."
+            )
+        else:
+            evidence = "模型未返回该维度评分，系统基于旧综合分和对应文本信号估算；重新分析时会优先使用模型原生分项。"
+        if dimension_text.strip():
+            evidence = dimension_text.strip().splitlines()[0][:80]
+
+        synthesized_dimensions[key] = {
+            "label": _scorecard_label(key, default_label, report_language),
+            "score": score,
+            "weight": default_weight,
+            "evidence": evidence,
+            "source": "model" if isinstance(raw_dimension, dict) else "fallback",
+        }
+
+    scorecard["dimensions"] = synthesized_dimensions
+    scorecard["score_method"] = scorecard.get("score_method") or (
+        "综合评分 = 技术面25% + 基本面25% + 估值20% + 新闻/情绪15% + 宏观/风险15%"
+        if normalize_report_language(report_language) == "zh"
+        else "Overall score = technical 25% + fundamentals 25% + valuation 20% + news/sentiment 15% + macro/risk 15%"
+    )
+    return normalize_dashboard_scorecard_payload(payload, report_language)
+
+
+def normalize_dashboard_scorecard_payload(
+    payload: Dict[str, Any],
+    report_language: str = "zh",
+) -> Optional[int]:
+    """Normalize dashboard.scorecard and return the weighted overall score."""
+    if not isinstance(payload, dict):
+        return None
+    dashboard = payload.get("dashboard")
+    if not isinstance(dashboard, dict):
+        return None
+    scorecard = dashboard.get("scorecard")
+    if not isinstance(scorecard, dict):
+        return None
+
+    raw_dimensions = scorecard.get("dimensions")
+    if not isinstance(raw_dimensions, dict):
+        raw_dimensions = {}
+
+    normalized_dimensions: Dict[str, Dict[str, Any]] = {}
+    weighted_total = 0.0
+    total_weight = 0.0
+    for key, default_label, default_weight in SCORECARD_DIMENSIONS:
+        raw_dimension = raw_dimensions.get(key)
+        if not isinstance(raw_dimension, dict):
+            raw_dimension = scorecard.get(key) if isinstance(scorecard.get(key), dict) else {}
+        score = _scorecard_int(raw_dimension.get("score")) if isinstance(raw_dimension, dict) else None
+        if score is None:
+            continue
+        weight_raw = raw_dimension.get("weight") if isinstance(raw_dimension, dict) else None
+        try:
+            weight = float(weight_raw if weight_raw not in (None, "") else default_weight)
+        except (TypeError, ValueError):
+            weight = float(default_weight)
+        if weight <= 0:
+            weight = float(default_weight)
+        label = raw_dimension.get("label") if isinstance(raw_dimension, dict) else None
+        evidence = raw_dimension.get("evidence") if isinstance(raw_dimension, dict) else None
+        normalized_dimension = dict(raw_dimension)
+        normalized_dimension.update({
+            "label": str(label or _scorecard_label(key, default_label, report_language)),
+            "score": score,
+            "weight": int(weight) if weight.is_integer() else weight,
+            "evidence": str(evidence or ""),
+        })
+        normalized_dimensions[key] = normalized_dimension
+        weighted_total += score * weight
+        total_weight += weight
+
+    overall_score = None
+    if total_weight > 0:
+        overall_score = _scorecard_int(weighted_total / total_weight, 50)
+    else:
+        overall_score = _scorecard_int(scorecard.get("overall_score"), None)
+
+    if overall_score is None:
+        return None
+
+    scorecard["overall_score"] = overall_score
+    scorecard["total_weight"] = int(total_weight) if total_weight.is_integer() else total_weight
+    scorecard["dimensions"] = normalized_dimensions
+    scorecard["score_method"] = scorecard.get("score_method") or (
+        "综合评分 = 技术面25% + 基本面25% + 估值20% + 新闻/情绪15% + 宏观/风险15%"
+        if normalize_report_language(report_language) == "zh"
+        else "Overall score = technical 25% + fundamentals 25% + valuation 20% + news/sentiment 15% + macro/risk 15%"
+    )
+    dashboard["scorecard"] = scorecard
+    payload["sentiment_score"] = overall_score
+    return overall_score
 
 
 # ---------- chip_structure fallback (Issue #589) ----------
@@ -605,6 +848,14 @@ class AnalysisResult:
 
     # ========== 元数据 ==========
     market_snapshot: Optional[Dict[str, Any]] = None  # 当日行情快照（展示用）
+    technical_indicator_snapshot: Optional[Dict[str, Any]] = None  # 扩展技术指标快照（展示用）
+    macro_snapshot: Optional[Dict[str, Any]] = None  # FRED 宏观指标快照（展示用）
+    fundamental_snapshot: Optional[Dict[str, Any]] = None  # 结构化财报摘要（展示用）
+    dividend_snapshot: Optional[Dict[str, Any]] = None  # 结构化分红指标（展示用）
+    peer_valuation_snapshot: Optional[Dict[str, Any]] = None  # 同类型估值对比（展示用）
+    insider_activity_snapshot: Optional[Dict[str, Any]] = None  # SEC 内部人申报快照（展示用）
+    filing_references: Optional[List[Dict[str, Any]]] = None  # 财报/SEC 原文链接（展示用）
+    news_context_snapshot: Optional[str] = None  # 搜索情报原文摘要（展示用）
     raw_response: Optional[str] = None  # 原始响应（调试用）
     search_performed: bool = False  # 是否执行了联网搜索
     data_sources: str = ""  # 数据来源说明
@@ -651,6 +902,14 @@ class AnalysisResult:
             'risk_warning': self.risk_warning,
             'buy_reason': self.buy_reason,
             'market_snapshot': self.market_snapshot,
+            'technical_indicator_snapshot': self.technical_indicator_snapshot,
+            'macro_snapshot': self.macro_snapshot,
+            'fundamental_snapshot': self.fundamental_snapshot,
+            'dividend_snapshot': self.dividend_snapshot,
+            'peer_valuation_snapshot': self.peer_valuation_snapshot,
+            'insider_activity_snapshot': self.insider_activity_snapshot,
+            'filing_references': self.filing_references,
+            'news_context_snapshot': self.news_context_snapshot,
             'search_performed': self.search_performed,
             'success': self.success,
             'error_message': self.error_message,
@@ -748,7 +1007,7 @@ class GeminiAnalyzer:
 ```json
 {
     "stock_name": "股票中文名称",
-    "sentiment_score": 0-100整数,
+    "sentiment_score": 0-100整数（必须等于 dashboard.scorecard.overall_score；这是多维综合分，不是单纯技术面分）,
     "trend_prediction": "强烈看多/看多/震荡/看空/强烈看空",
     "operation_advice": "买入/加仓/持有/减仓/卖出/观望",
     "decision_type": "buy/hold/sell",
@@ -756,12 +1015,24 @@ class GeminiAnalyzer:
 
     "dashboard": {
         "core_conclusion": {
-            "one_sentence": "一句话核心结论（30字以内，直接告诉用户做什么）",
+            "one_sentence": "一句话核心结论（50-90字，直接告诉用户做什么；必须同时引用至少2个维度，不能只复述均线/乖离率）",
             "signal_type": "🟢买入信号/🟡持有观望/🔴卖出信号/⚠️风险警告",
             "time_sensitivity": "立即行动/今日内/本周内/不急",
             "position_advice": {
                 "no_position": "空仓者建议：具体操作指引",
                 "has_position": "持仓者建议：具体操作指引"
+            }
+        },
+
+        "scorecard": {
+            "overall_score": 0-100整数,
+            "score_method": "综合评分 = 技术面25% + 基本面25% + 估值20% + 新闻/情绪15% + 宏观/风险15%",
+            "dimensions": {
+                "technical": {"label": "技术面", "score": 0-100整数, "weight": 25, "evidence": "趋势、均线、量能、波动率等证据"},
+                "fundamental": {"label": "基本面", "score": 0-100整数, "weight": 25, "evidence": "收入、利润率、现金流、资产负债、ROE/FCF质量等证据"},
+                "valuation": {"label": "估值", "score": 0-100整数, "weight": 20, "evidence": "PE/PB/PS/EV等与同类型公司或历史区间的比较"},
+                "news_sentiment": {"label": "新闻/情绪", "score": 0-100整数, "weight": 15, "evidence": "新闻、公告、分析师观点、社交/舆情催化与风险"},
+                "macro_risk": {"label": "宏观/风险", "score": 0-100整数, "weight": 15, "evidence": "利率、通胀、美元、行业周期、监管/诉讼等风险背景"}
             }
         },
 
@@ -852,6 +1123,14 @@ class GeminiAnalyzer:
 
 ## 评分标准
 
+### 多维评分口径（必须执行）
+- sentiment_score 必须等于 dashboard.scorecard.overall_score。
+- overall_score 必须按固定权重计算：技术面25%、基本面25%、估值20%、新闻/情绪15%、宏观/风险15%。
+- 技术面只能占 25%，不能因为短线均线/乖离率单独决定总分。
+- 基本面分必须参考财报、利润质量、现金流、资产负债表、长期竞争力；数据缺失时给中性偏低分，并在 evidence 写明缺口。
+- 估值分必须参考同类型公司/历史区间/增长预期，不能只看绝对 PE/PB。
+- 核心洞察必须综合长期基本面、估值、消息/情绪、宏观风险和技术位置，不得只写 MA5/MA20/RSI/量能。
+
 ### 强烈买入（80-100分）：
 - ✅ 多头排列：MA5 > MA10 > MA20
 - ✅ 低乖离率：<2%，最佳买点
@@ -898,7 +1177,7 @@ class GeminiAnalyzer:
 ```json
 {
     "stock_name": "股票中文名称",
-    "sentiment_score": 0-100整数,
+    "sentiment_score": 0-100整数（必须等于 dashboard.scorecard.overall_score；这是多维综合分，不是单纯技术面分）,
     "trend_prediction": "强烈看多/看多/震荡/看空/强烈看空",
     "operation_advice": "买入/加仓/持有/减仓/卖出/观望",
     "decision_type": "buy/hold/sell",
@@ -906,12 +1185,24 @@ class GeminiAnalyzer:
 
     "dashboard": {
         "core_conclusion": {
-            "one_sentence": "一句话核心结论（30字以内，直接告诉用户做什么）",
+            "one_sentence": "一句话核心结论（50-90字，直接告诉用户做什么；必须同时引用至少2个维度，不能只复述均线/乖离率）",
             "signal_type": "🟢买入信号/🟡持有观望/🔴卖出信号/⚠️风险警告",
             "time_sensitivity": "立即行动/今日内/本周内/不急",
             "position_advice": {
                 "no_position": "空仓者建议：具体操作指引",
                 "has_position": "持仓者建议：具体操作指引"
+            }
+        },
+
+        "scorecard": {
+            "overall_score": 0-100整数,
+            "score_method": "综合评分 = 技术面25% + 基本面25% + 估值20% + 新闻/情绪15% + 宏观/风险15%",
+            "dimensions": {
+                "technical": {"label": "技术面", "score": 0-100整数, "weight": 25, "evidence": "趋势、均线、量能、波动率等证据"},
+                "fundamental": {"label": "基本面", "score": 0-100整数, "weight": 25, "evidence": "收入、利润率、现金流、资产负债、ROE/FCF质量等证据"},
+                "valuation": {"label": "估值", "score": 0-100整数, "weight": 20, "evidence": "PE/PB/PS/EV等与同类型公司或历史区间的比较"},
+                "news_sentiment": {"label": "新闻/情绪", "score": 0-100整数, "weight": 15, "evidence": "新闻、公告、分析师观点、社交/舆情催化与风险"},
+                "macro_risk": {"label": "宏观/风险", "score": 0-100整数, "weight": 15, "evidence": "利率、通胀、美元、行业周期、监管/诉讼等风险背景"}
             }
         },
 
@@ -1001,6 +1292,14 @@ class GeminiAnalyzer:
 ```
 
 ## 评分标准
+
+### 多维评分口径（必须执行）
+- sentiment_score 必须等于 dashboard.scorecard.overall_score。
+- overall_score 必须按固定权重计算：技术面25%、基本面25%、估值20%、新闻/情绪15%、宏观/风险15%。
+- 技术面只能占 25%，不能因为短线均线/乖离率单独决定总分。
+- 基本面分必须参考财报、利润质量、现金流、资产负债表、长期竞争力；数据缺失时给中性偏低分，并在 evidence 写明缺口。
+- 估值分必须参考同类型公司/历史区间/增长预期，不能只看绝对 PE/PB。
+- 核心洞察必须综合长期基本面、估值、消息/情绪、宏观风险和技术位置，不得只写 MA5/MA20/RSI/量能。
 
 ### 强烈买入（80-100分）：
 - ✅ 多个激活技能同时支持积极结论
@@ -1624,7 +1923,15 @@ class GeminiAnalyzer:
                 result = self._parse_response(response_text, code, name)
                 result.raw_response = response_text
                 result.search_performed = bool(news_context)
+                result.news_context_snapshot = news_context or ""
                 result.market_snapshot = self._build_market_snapshot(context)
+                result.technical_indicator_snapshot = self._build_technical_indicator_snapshot(context)
+                result.macro_snapshot = self._build_macro_snapshot(context)
+                result.fundamental_snapshot = self._build_fundamental_snapshot(context)
+                result.dividend_snapshot = self._build_dividend_snapshot(context)
+                result.peer_valuation_snapshot = self._build_peer_valuation_snapshot(context)
+                result.insider_activity_snapshot = self._build_insider_activity_snapshot(context)
+                result.filing_references = self._build_filing_references(context)
                 result.model_used = model_used
                 result.report_language = report_language
 
@@ -1764,8 +2071,50 @@ class GeminiAnalyzer:
 | 60日涨跌幅 | {rt.get('change_60d', 'N/A')}% | 中期表现 |
 """
 
-        # 添加财报与分红（价值投资口径）
         fundamental_context = context.get("fundamental_context") if isinstance(context, dict) else None
+        peer_valuation = (
+            fundamental_context.get("peer_valuation", {})
+            if isinstance(fundamental_context, dict)
+            else {}
+        )
+        peer_rows = (
+            peer_valuation.get("rows", [])
+            if isinstance(peer_valuation, dict)
+            else []
+        )
+        if isinstance(peer_rows, list) and peer_rows:
+            basis = peer_valuation.get("comparison_basis") or "同类型/同行业可比公司"
+            prompt += f"""
+### 同类型估值对比（相对估值）
+> 对比口径：{basis}
+
+| 公司 | 当前价 | PE | PB | 市值 |
+|------|--------|----|----|------|
+"""
+            for row in peer_rows[:6]:
+                if not isinstance(row, dict):
+                    continue
+                label = f"{row.get('symbol', 'N/A')} {row.get('name', '')}".strip()
+                if row.get("is_target"):
+                    label = f"**{label}**"
+                prompt += (
+                    f"| {label} | {row.get('price', 'N/A')} | "
+                    f"{row.get('pe_ratio', 'N/A')} | {row.get('pb_ratio', 'N/A')} | "
+                    f"{row.get('market_cap_text', 'N/A')} |\n"
+                )
+
+            summary = peer_valuation.get("summary", {}) if isinstance(peer_valuation, dict) else {}
+            if isinstance(summary, dict) and summary:
+                prompt += (
+                    f"\n> Peer 中位数：PE={summary.get('peer_median_pe_ratio', 'N/A')}，"
+                    f"PB={summary.get('peer_median_pb_ratio', 'N/A')}；"
+                    f"标的相对中位数：PE {summary.get('pe_ratio_vs_peer_median_pct', 'N/A')}%，"
+                    f"PB {summary.get('pb_ratio_vs_peer_median_pct', 'N/A')}%。"
+                    " 请据此判断估值是溢价、折价还是合理，并说明 peer 口径局限，结合增长/利润质量解释。"
+                    "\n"
+                )
+
+        # 添加财报与分红（价值投资口径）
         earnings_block = (
             fundamental_context.get("earnings", {})
             if isinstance(fundamental_context, dict)
@@ -1789,25 +2138,202 @@ class GeminiAnalyzer:
         if isinstance(financial_report, dict) or isinstance(dividend_metrics, dict):
             financial_report = financial_report if isinstance(financial_report, dict) else {}
             dividend_metrics = dividend_metrics if isinstance(dividend_metrics, dict) else {}
-            ttm_yield = dividend_metrics.get("ttm_dividend_yield_pct", "N/A")
-            ttm_cash = dividend_metrics.get("ttm_cash_dividend_per_share", "N/A")
-            ttm_count = dividend_metrics.get("ttm_event_count", "N/A")
+            def _display_value(value: Any) -> str:
+                if value is None or value == "":
+                    return "N/A"
+                return str(value)
+
+            ttm_cash_raw = dividend_metrics.get("ttm_cash_dividend_per_share", "N/A")
+            ttm_yield_raw = dividend_metrics.get("ttm_dividend_yield_pct", "N/A")
+            if (
+                (ttm_yield_raw is None or str(ttm_yield_raw).strip().upper() in {"", "N/A", "NA"})
+                and ttm_cash_raw is not None
+            ):
+                realtime_price = None
+                realtime_block = context.get("realtime", {}) if isinstance(context, dict) else {}
+                if isinstance(realtime_block, dict):
+                    try:
+                        realtime_price = float(realtime_block.get("price"))
+                    except (TypeError, ValueError):
+                        realtime_price = None
+                try:
+                    ttm_cash_float = float(ttm_cash_raw)
+                except (TypeError, ValueError):
+                    ttm_cash_float = None
+                if ttm_cash_float is not None and realtime_price and realtime_price > 0:
+                    ttm_yield_raw = round(ttm_cash_float / realtime_price * 100.0, 4)
+
+            ttm_cash = _display_value(ttm_cash_raw)
+            if isinstance(ttm_yield_raw, (int, float)):
+                ttm_yield = f"{float(ttm_yield_raw):.4f}%"
+            else:
+                ttm_yield = _display_value(ttm_yield_raw)
+            ttm_count = _display_value(dividend_metrics.get("ttm_event_count", "N/A"))
             report_date = financial_report.get("report_date", "N/A")
             prompt += f"""
 ### 财报与分红（价值投资口径）
 | 指标 | 数值 | 说明 |
 |------|------|------|
 | 最近报告期 | {report_date} | 来自结构化财报字段 |
-| 营业收入 | {financial_report.get('revenue', 'N/A')} | |
-| 归母净利润 | {financial_report.get('net_profit_parent', 'N/A')} | |
-| 经营现金流 | {financial_report.get('operating_cash_flow', 'N/A')} | |
-| ROE | {financial_report.get('roe', 'N/A')} | |
-| 近12个月每股现金分红 | {ttm_cash} | 仅现金分红、税前口径 |
+| 营业收入 | {financial_report.get('revenue', 'N/A')} | {financial_report.get('revenue_period', '')} |
+| 归母净利润 | {financial_report.get('net_profit_parent', 'N/A')} | {financial_report.get('net_profit_parent_period', '')} |
+| 经营现金流 | {financial_report.get('operating_cash_flow', 'N/A')} | {financial_report.get('operating_cash_flow_period', '')} |
+| ROE | {financial_report.get('roe', 'N/A')} | {financial_report.get('roe_note', '')} |
+| 近12个月每股现金分红 | {ttm_cash} | 仅现金分红、税前口径；美股优先用 Yahoo Finance 分红事件 |
 | TTM 股息率 | {ttm_yield} | 公式：近12个月每股现金分红 / 当前价格 × 100% |
 | TTM 分红事件数 | {ttm_count} | |
 
 > 若上述字段为 N/A 或缺失，请明确写“数据缺失，无法判断”，禁止编造。
 """
+            quarterly_trend = financial_report.get("quarterly_trend")
+            if isinstance(quarterly_trend, list) and quarterly_trend:
+                prompt += """
+#### 最近季度趋势（结构化财报）
+| 期间 | 收入 | 较前值 | YoY | 净利润 | 较前值 | YoY | 净利率 | FCF |
+|------|------|--------|-----|--------|--------|-----|--------|-----|
+"""
+                for row in quarterly_trend[:5]:
+                    if not isinstance(row, dict):
+                        continue
+                    def _trend_pct(value: Any) -> str:
+                        if value is None or value == "":
+                            return "N/A"
+                        try:
+                            return f"{float(value):+.2f}%"
+                        except (TypeError, ValueError):
+                            return str(value)
+                    net_margin = row.get("net_margin_pct")
+                    net_margin_text = "N/A" if net_margin is None else f"{float(net_margin):.2f}%"
+                    prompt += (
+                        f"| {row.get('period', 'N/A')} | {row.get('revenue', 'N/A')} | "
+                        f"{_trend_pct(row.get('revenue_value_change_pct'))} | "
+                        f"{_trend_pct(row.get('revenue_value_yoy_pct'))} | "
+                        f"{row.get('net_profit_parent', 'N/A')} | "
+                        f"{_trend_pct(row.get('net_profit_parent_value_change_pct'))} | "
+                        f"{_trend_pct(row.get('net_profit_parent_value_yoy_pct'))} | "
+                        f"{net_margin_text} | {row.get('free_cash_flow', 'N/A')} |\n"
+                    )
+
+            prompt += """
+#### 三框架分析方法论要求
+请把以下三个框架聚合进诊股判断，但不要写成冗长机构报告：
+- 科技股/半导体财报深挖：先识别未来 1-3 年最重要的 1-3 个关键力量，再分析收入、利润率、现金流、产品/业务周期、管理层指引、竞争格局、估值隐含预期。
+- 美国价值投资四维：ROE 可持续性、债务安全性、自由现金流质量、经济护城河。明确哪些是硬数据、哪些是定性初判。
+- 美国市场情绪与风险预算：用利率、通胀、市场广度/技术热度、估值拥挤度解释当前应该提高、维持还是降低风险预算；它不能单独决定买卖。
+
+请按“收入质量、盈利能力、现金流质量、资产负债、资本配置、红旗/绿灯”六个角度解读财报：
+- 收入质量：收入规模、增速可持续性、是否依赖单一产品/地区/一次性项目。
+- 盈利能力：净利率、ROE、EPS，说明高 ROE 是否受回购或低权益基数放大。
+- 现金流质量：经营现金流/净利润、自由现金流/净利润，判断利润是否转化成现金。
+- 资产负债：资产负债率、权益比率、流动性与利率环境压力。
+- 资本配置：分红、回购、CapEx、并购，判断对股东是否友好。
+- 红旗/绿灯：列出 2-3 个最重要的正面信号和 2-3 个需要跟踪的风险，不要只复述数字。
+"""
+            filings = (
+                earnings_data.get("filings", {})
+                if isinstance(earnings_data, dict)
+                else {}
+            )
+            filing_refs = (
+                filings.get("filing_references", [])
+                if isinstance(filings, dict)
+                else []
+            )
+            if isinstance(filing_refs, list) and filing_refs:
+                prompt += """
+#### SEC EDGAR 财报原文链接
+| 类型 | 报告期 | 提交日期 | 原文链接 |
+|------|--------|----------|----------|
+"""
+                for filing in filing_refs[:5]:
+                    if not isinstance(filing, dict):
+                        continue
+                    url = (
+                        filing.get("pdf_url")
+                        or filing.get("document_url")
+                        or filing.get("sec_url")
+                        or filing.get("filing_detail_url")
+                        or filing.get("inline_xbrl_url")
+                    )
+                    url = self._normalize_sec_archive_url(url)
+                    if not url:
+                        continue
+                    prompt += (
+                        f"| {filing.get('form', 'N/A')} | {filing.get('report_date', 'N/A')} | "
+                        f"{filing.get('filing_date', 'N/A')} | {url} |\n"
+                    )
+                prompt += """
+> 上述链接为公开财报原文。SEC 文件通常是 HTML/Inline XBRL；若披露包中存在 PDF 附件则优先使用 PDF。
+"""
+
+        insider_block = (
+            fundamental_context.get("insider_activity", {})
+            if isinstance(fundamental_context, dict)
+            else {}
+        )
+        insider_data = (
+            insider_block.get("data", {})
+            if isinstance(insider_block, dict)
+            else {}
+        )
+        insider_filings = (
+            insider_data.get("recent_filings", [])
+            if isinstance(insider_data, dict)
+            else []
+        )
+        if isinstance(insider_filings, list) and insider_filings:
+            prompt += """
+### SEC 内部人申报（Form 3/4/5/144）
+| 类型 | 报告期 | 提交日期 | 原文链接 |
+|------|--------|----------|----------|
+"""
+            for filing in insider_filings[:6]:
+                if not isinstance(filing, dict):
+                    continue
+                url = (
+                    filing.get("document_url")
+                    or filing.get("sec_url")
+                    or filing.get("filing_detail_url")
+                    or filing.get("inline_xbrl_url")
+                )
+                url = self._normalize_sec_archive_url(url)
+                if not url:
+                    continue
+                prompt += (
+                    f"| {filing.get('form', 'N/A')} | {filing.get('report_date', 'N/A')} | "
+                    f"{filing.get('filing_date', 'N/A')} | {url} |\n"
+                )
+            prompt += """
+> Form 4 通常用于内部人持股变动披露；这里先展示 SEC 原文链接，具体买卖方向需结合表内交易代码进一步确认。
+"""
+
+        macro_context = (
+            fundamental_context.get("macro", {})
+            if isinstance(fundamental_context, dict)
+            else {}
+        )
+        indicators = (
+            macro_context.get("indicators", {})
+            if isinstance(macro_context, dict)
+            else {}
+        )
+        if isinstance(indicators, dict) and indicators:
+            prompt += """
+### FRED 宏观环境（美股适用）
+| 指标 | 数值 | 日期 | 说明 |
+|------|------|------|------|
+"""
+            for indicator in indicators.values():
+                if not isinstance(indicator, dict):
+                    continue
+                value = indicator.get("value", "N/A")
+                unit = indicator.get("unit", "")
+                prompt += (
+                    f"| {indicator.get('label', indicator.get('series_id', 'N/A'))} | "
+                    f"{value}{unit} | {indicator.get('date', 'N/A')} | "
+                    f"{indicator.get('note', '')} |\n"
+                )
+            prompt += "\n> 请把宏观指标作为估值折现率、风险偏好和板块风格的背景变量，不要把它当作公司基本面本身。\n"
 
         # 添加筹码分布数据
         if 'chip' in context:
@@ -1890,6 +2416,47 @@ class GeminiAnalyzer:
 
 **一致性约束**：
 {chr(10).join('- ' + note for note in consistency_notes)}
+"""
+
+            def _fmt_indicator(value: Any, precision: int = 2) -> str:
+                if value is None or value == "":
+                    return "N/A"
+                try:
+                    number = float(value)
+                    if not math.isfinite(number):
+                        return "N/A"
+                    return f"{number:.{precision}f}"
+                except (TypeError, ValueError):
+                    return str(value)
+
+            extended_indicator_keys = (
+                "ema10",
+                "ma50",
+                "ma200",
+                "boll_mid",
+                "boll_upper",
+                "boll_lower",
+                "atr14",
+                "vwma20",
+                "mfi14",
+            )
+            if any(trend.get(key) is not None for key in extended_indicator_keys):
+                prompt += f"""
+
+#### 扩展技术指标（参考 TradingAgents 指标口径）
+| 指标 | 数值 | 用途 |
+|------|------|------|
+| EMA10 | {_fmt_indicator(trend.get('ema10'))} | 短线动量 |
+| MA50 | {_fmt_indicator(trend.get('ma50'))} | 中期趋势 |
+| MA200 | {_fmt_indicator(trend.get('ma200'))} | 长期趋势/牛熊分界 |
+| Boll 中轨 | {_fmt_indicator(trend.get('boll_mid'))} | 20日均值 |
+| Boll 上轨 | {_fmt_indicator(trend.get('boll_upper'))} | 波动上沿/压力 |
+| Boll 下轨 | {_fmt_indicator(trend.get('boll_lower'))} | 波动下沿/支撑 |
+| ATR14 | {_fmt_indicator(trend.get('atr14'))} | 波动率/止损距离 |
+| VWMA20 | {_fmt_indicator(trend.get('vwma20'))} | 成交量加权趋势 |
+| MFI14 | {_fmt_indicator(trend.get('mfi14'))} | 资金流强弱，>80偏热，<20偏冷 |
+
+> 请把这些指标用于确认趋势、动量、波动率和量价配合；若 MA200 为 N/A，说明本地历史 K 线不足，不要编造长期趋势结论。
 """
         
         # 添加昨日对比数据
@@ -2123,6 +2690,257 @@ class GeminiAnalyzer:
 
         return snapshot
 
+    def _build_technical_indicator_snapshot(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract extended technical indicators for Markdown/PDF reports."""
+        trend_analysis = context.get("trend_analysis") if isinstance(context, dict) else None
+        if not isinstance(trend_analysis, dict):
+            return {}
+
+        keys = (
+            "ema10",
+            "ma50",
+            "ma200",
+            "boll_mid",
+            "boll_upper",
+            "boll_lower",
+            "atr14",
+            "vwma20",
+            "mfi14",
+        )
+        values = {key: trend_analysis.get(key) for key in keys}
+        if all(value in (None, "", "N/A") for value in values.values()):
+            return {}
+        snapshot = dict(values)
+        snapshot["source"] = trend_analysis.get("source") or "StockTrendAnalyzer"
+        return snapshot
+
+    def _build_filing_references(self, context: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Extract public filing links for Markdown/PDF reports."""
+        fundamental_context = context.get("fundamental_context") if isinstance(context, dict) else None
+        if not isinstance(fundamental_context, dict):
+            return []
+        earnings = fundamental_context.get("earnings")
+        earnings_data = earnings.get("data") if isinstance(earnings, dict) else None
+        filings = earnings_data.get("filings") if isinstance(earnings_data, dict) else None
+        refs = filings.get("filing_references") if isinstance(filings, dict) else None
+        if not isinstance(refs, list):
+            return []
+
+        normalized: List[Dict[str, Any]] = []
+        seen = set()
+        for item in refs:
+            if not isinstance(item, dict):
+                continue
+            url = (
+                item.get("pdf_url")
+                or item.get("document_url")
+                or item.get("sec_url")
+                or item.get("filing_detail_url")
+                or item.get("inline_xbrl_url")
+            )
+            url = self._normalize_sec_archive_url(url)
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            normalized.append(
+                {
+                    "form": item.get("form"),
+                    "report_date": item.get("report_date"),
+                    "filing_date": item.get("filing_date"),
+                    "url": url,
+                    "pdf_url": item.get("pdf_url"),
+                    "document_url": item.get("document_url") or item.get("sec_url"),
+                    "sec_url": item.get("sec_url"),
+                    "inline_xbrl_url": item.get("inline_xbrl_url"),
+                    "filing_detail_url": item.get("filing_detail_url"),
+                    "description": item.get("primary_doc_description"),
+                }
+            )
+        return normalized
+
+    @staticmethod
+    def _normalize_sec_archive_url(url: Any) -> str:
+        """Convert fragile SEC ixviewer URLs to direct Archives document URLs."""
+        text = str(url or "").strip()
+        if not text:
+            return ""
+        if "/ixviewer/doc/action" not in text or "doc=" not in text:
+            return text
+        parsed = urllib.parse.urlparse(text)
+        doc = urllib.parse.parse_qs(parsed.query).get("doc", [""])[0]
+        doc = urllib.parse.unquote(doc)
+        if doc.startswith("/Archives/"):
+            return f"https://www.sec.gov{doc}"
+        return text
+
+    def _build_macro_snapshot(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract FRED macro indicators for Markdown/PDF reports."""
+        fundamental_context = context.get("fundamental_context") if isinstance(context, dict) else None
+        if not isinstance(fundamental_context, dict):
+            return {}
+        macro_context = fundamental_context.get("macro")
+        if not isinstance(macro_context, dict):
+            return {}
+        indicators = macro_context.get("indicators")
+        if not isinstance(indicators, dict) or not indicators:
+            return {}
+
+        return {
+            "provider": macro_context.get("provider") or "FRED",
+            "status": macro_context.get("status"),
+            "indicators": [
+                item
+                for item in indicators.values()
+                if isinstance(item, dict)
+            ],
+        }
+
+    def _build_fundamental_snapshot(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract the structured financial-report block for Markdown/PDF reports."""
+        fundamental_context = context.get("fundamental_context") if isinstance(context, dict) else None
+        if not isinstance(fundamental_context, dict):
+            return {}
+        earnings = fundamental_context.get("earnings")
+        earnings_data = earnings.get("data") if isinstance(earnings, dict) else None
+        financial_report = earnings_data.get("financial_report") if isinstance(earnings_data, dict) else None
+        if not isinstance(financial_report, dict) or not financial_report:
+            return {}
+
+        return {
+            "provider": fundamental_context.get("provider") or financial_report.get("source"),
+            "form": financial_report.get("form"),
+            "report_date": financial_report.get("report_date"),
+            "filing_date": financial_report.get("filing_date"),
+            "revenue": financial_report.get("revenue"),
+            "revenue_period": financial_report.get("revenue_period"),
+            "net_profit_parent": financial_report.get("net_profit_parent"),
+            "net_profit_parent_period": financial_report.get("net_profit_parent_period"),
+            "operating_cash_flow": financial_report.get("operating_cash_flow"),
+            "operating_cash_flow_period": financial_report.get("operating_cash_flow_period"),
+            "capital_expenditure": financial_report.get("capital_expenditure"),
+            "capital_expenditure_period": financial_report.get("capital_expenditure_period"),
+            "free_cash_flow": financial_report.get("free_cash_flow"),
+            "roe": financial_report.get("roe"),
+            "roe_note": financial_report.get("roe_note"),
+            "assets": financial_report.get("assets"),
+            "liabilities": financial_report.get("liabilities"),
+            "shareholders_equity": financial_report.get("shareholders_equity"),
+            "eps_diluted": financial_report.get("eps_diluted"),
+            "cash_and_equivalents": financial_report.get("cash_and_equivalents"),
+            "marketable_securities_current": financial_report.get("marketable_securities_current"),
+            "marketable_securities_noncurrent": financial_report.get("marketable_securities_noncurrent"),
+            "liquid_assets": financial_report.get("liquid_assets"),
+            "commercial_paper": financial_report.get("commercial_paper"),
+            "long_term_debt": financial_report.get("long_term_debt"),
+            "interest_bearing_debt": financial_report.get("interest_bearing_debt"),
+            "net_cash": financial_report.get("net_cash"),
+            "revenue_value": financial_report.get("revenue_value"),
+            "net_profit_parent_value": financial_report.get("net_profit_parent_value"),
+            "operating_cash_flow_value": financial_report.get("operating_cash_flow_value"),
+            "capital_expenditure_value": financial_report.get("capital_expenditure_value"),
+            "free_cash_flow_value": financial_report.get("free_cash_flow_value"),
+            "assets_value": financial_report.get("assets_value"),
+            "liabilities_value": financial_report.get("liabilities_value"),
+            "shareholders_equity_value": financial_report.get("shareholders_equity_value"),
+            "cash_and_equivalents_value": financial_report.get("cash_and_equivalents_value"),
+            "marketable_securities_current_value": financial_report.get("marketable_securities_current_value"),
+            "marketable_securities_noncurrent_value": financial_report.get("marketable_securities_noncurrent_value"),
+            "liquid_assets_value": financial_report.get("liquid_assets_value"),
+            "commercial_paper_value": financial_report.get("commercial_paper_value"),
+            "long_term_debt_value": financial_report.get("long_term_debt_value"),
+            "interest_bearing_debt_value": financial_report.get("interest_bearing_debt_value"),
+            "net_cash_value": financial_report.get("net_cash_value"),
+            "net_margin_pct": financial_report.get("net_margin_pct"),
+            "operating_cash_flow_to_net_income_pct": financial_report.get("operating_cash_flow_to_net_income_pct"),
+            "free_cash_flow_to_net_income_pct": financial_report.get("free_cash_flow_to_net_income_pct"),
+            "debt_to_assets_pct": financial_report.get("debt_to_assets_pct"),
+            "interest_bearing_debt_to_assets_pct": financial_report.get("interest_bearing_debt_to_assets_pct"),
+            "liquid_assets_to_interest_bearing_debt_pct": financial_report.get("liquid_assets_to_interest_bearing_debt_pct"),
+            "equity_ratio_pct": financial_report.get("equity_ratio_pct"),
+            "asset_to_equity": financial_report.get("asset_to_equity"),
+            "quarterly_trend": financial_report.get("quarterly_trend") or [],
+            "annual_trend": financial_report.get("annual_trend") or [],
+        }
+
+    def _build_dividend_snapshot(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract structured dividend metrics for Markdown/PDF reports."""
+        fundamental_context = context.get("fundamental_context") if isinstance(context, dict) else None
+        if not isinstance(fundamental_context, dict):
+            return {}
+        earnings = fundamental_context.get("earnings")
+        earnings_data = earnings.get("data") if isinstance(earnings, dict) else None
+        dividend = earnings_data.get("dividend") if isinstance(earnings_data, dict) else None
+        if not isinstance(dividend, dict) or not dividend:
+            return {}
+
+        ttm_cash = dividend.get("ttm_cash_dividend_per_share")
+        ttm_yield = dividend.get("ttm_dividend_yield_pct")
+        if ttm_yield is None or str(ttm_yield).strip().upper() in {"", "N/A", "NA"}:
+            realtime = context.get("realtime", {}) if isinstance(context, dict) else {}
+            try:
+                price = float(realtime.get("price")) if isinstance(realtime, dict) else None
+                cash = float(ttm_cash)
+            except (TypeError, ValueError):
+                price = None
+                cash = None
+            if price and price > 0 and cash is not None:
+                ttm_yield = round(cash / price * 100.0, 4)
+
+        return {
+            "ttm_cash_dividend_per_share": ttm_cash,
+            "ttm_dividend_yield_pct": ttm_yield,
+            "ttm_event_count": dividend.get("ttm_event_count"),
+            "latest_dividend_fact": dividend.get("latest_dividend_fact"),
+            "source": dividend.get("source"),
+            "events": dividend.get("events", []),
+        }
+
+    def _build_peer_valuation_snapshot(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract peer valuation comparison for Markdown/PDF reports."""
+        fundamental_context = context.get("fundamental_context") if isinstance(context, dict) else None
+        if not isinstance(fundamental_context, dict):
+            return {}
+        peer_valuation = fundamental_context.get("peer_valuation")
+        if not isinstance(peer_valuation, dict):
+            return {}
+        rows = peer_valuation.get("rows")
+        if not isinstance(rows, list) or not rows:
+            return {}
+        return {
+            "provider": peer_valuation.get("provider") or "Longbridge",
+            "source": peer_valuation.get("source"),
+            "status": peer_valuation.get("status"),
+            "market": peer_valuation.get("market"),
+            "target": peer_valuation.get("target"),
+            "comparison_basis": peer_valuation.get("comparison_basis"),
+            "rows": [row for row in rows if isinstance(row, dict)],
+            "summary": peer_valuation.get("summary", {}),
+        }
+
+    def _build_insider_activity_snapshot(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract SEC insider filing references for Markdown/PDF reports."""
+        fundamental_context = context.get("fundamental_context") if isinstance(context, dict) else None
+        if not isinstance(fundamental_context, dict):
+            return {}
+        insider_activity = fundamental_context.get("insider_activity")
+        if not isinstance(insider_activity, dict):
+            return {}
+        data = insider_activity.get("data")
+        if not isinstance(data, dict):
+            return {}
+        filings = data.get("recent_filings")
+        if not isinstance(filings, list) or not filings:
+            return {}
+        normalized = [item for item in filings if isinstance(item, dict)]
+        if not normalized:
+            return {}
+        return {
+            "provider": fundamental_context.get("provider") or data.get("source") or "SEC EDGAR",
+            "source": data.get("source"),
+            "forms": data.get("forms", []),
+            "recent_filings": normalized[:6],
+        }
+
     def _check_content_integrity(self, result: AnalysisResult) -> Tuple[bool, List[str]]:
         """Delegate to module-level check_content_integrity."""
         return check_content_integrity(result)
@@ -2232,7 +3050,8 @@ class GeminiAnalyzer:
                         str(e)[:100],
                     )
 
-                # 提取 dashboard 数据
+                normalized_score = ensure_dashboard_scorecard_payload(data, report_language)
+                # 提取 dashboard 数据（ensure 可能会为旧格式响应补出 dashboard.scorecard）
                 dashboard = data.get('dashboard', None)
 
                 # 优先使用 AI 返回的股票名称（如果原名称无效或包含代码）
@@ -2251,7 +3070,7 @@ class GeminiAnalyzer:
                     code=code,
                     name=name,
                     # 核心指标
-                    sentiment_score=int(data.get('sentiment_score', 50)),
+                    sentiment_score=int(normalized_score if normalized_score is not None else data.get('sentiment_score', 50)),
                     trend_prediction=data.get('trend_prediction', 'Sideways' if report_language == "en" else '震荡'),
                     operation_advice=data.get('operation_advice', 'Hold' if report_language == "en" else '持有'),
                     decision_type=decision_type,

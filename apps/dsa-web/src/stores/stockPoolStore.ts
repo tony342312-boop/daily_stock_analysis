@@ -15,6 +15,11 @@ type FetchHistoryOptions = {
   autoSelectFirst?: boolean;
   reset?: boolean;
   silent?: boolean;
+  allUsers?: boolean;
+};
+
+type HistoryScopeOptions = {
+  allUsers?: boolean;
 };
 
 type SubmitAnalysisOptions = {
@@ -46,6 +51,9 @@ export interface StockPoolState {
   isLoadingMore: boolean;
   hasMore: boolean;
   currentPage: number;
+  historyAllUsers: boolean;
+  historyRetentionDays?: number;
+  historyAutoCleanupEnabled?: boolean;
   selectedReport: AnalysisReport | null;
   isLoadingReport: boolean;
   activeTasks: TaskInfo[];
@@ -55,9 +63,9 @@ export interface StockPoolState {
   clearInlineMessages: () => void;
   openMarkdownDrawer: () => void;
   closeMarkdownDrawer: () => void;
-  loadInitialHistory: () => Promise<void>;
-  refreshHistory: (silent?: boolean) => Promise<void>;
-  loadMoreHistory: () => Promise<void>;
+  loadInitialHistory: (options?: HistoryScopeOptions) => Promise<void>;
+  refreshHistory: (silent?: boolean, options?: HistoryScopeOptions) => Promise<void>;
+  loadMoreHistory: (options?: HistoryScopeOptions) => Promise<void>;
   selectHistoryItem: (recordId: number) => Promise<void>;
   toggleHistorySelection: (recordId: number) => void;
   toggleSelectAllVisible: () => void;
@@ -86,19 +94,31 @@ const initialState = {
   isLoadingMore: false,
   hasMore: true,
   currentPage: 1,
+  historyAllUsers: false,
+  historyRetentionDays: undefined as number | undefined,
+  historyAutoCleanupEnabled: undefined as boolean | undefined,
   selectedReport: null as AnalysisReport | null,
   isLoadingReport: false,
   activeTasks: [] as TaskInfo[],
   markdownDrawerOpen: false,
 };
 
-function buildHistoryParams(page: number) {
+function buildHistoryParams(page: number, allUsers = false) {
   return {
     startDate: getRecentStartDate(30),
     endDate: getTodayInShanghai(),
     page,
     limit: PAGE_SIZE,
+    ...(allUsers ? { allUsers: true } : {}),
   };
+}
+
+function resolveSeaAlias(input: string): { stockCode: string; stockName: string } | null {
+  const normalized = input.trim().toLowerCase().replace(/[._-]+/g, ' ').replace(/\s+/g, ' ');
+  if (['sea', 'se a', 'sea limited', 'shopee', '虾皮', '冬海集团'].includes(normalized)) {
+    return { stockCode: 'SE', stockName: 'Sea Limited' };
+  }
+  return null;
 }
 
 async function fetchHistory(
@@ -108,19 +128,20 @@ async function fetchHistory(
 ): Promise<HistoryListResponse | null> {
   const { autoSelectFirst = false, reset = true, silent = false } = options;
   const currentState = get();
+  const allUsers = options.allUsers ?? currentState.historyAllUsers;
   const page = reset ? 1 : currentState.currentPage + 1;
   const requestId = ++historyRequestSeq;
 
   if (!silent) {
     set(
       reset
-        ? { isLoadingHistory: true, isLoadingMore: false, currentPage: 1 }
-        : { isLoadingMore: true },
+        ? { isLoadingHistory: true, isLoadingMore: false, currentPage: 1, historyAllUsers: allUsers }
+        : { isLoadingMore: true, historyAllUsers: allUsers },
     );
   }
 
   try {
-    const response = await historyApi.getList(buildHistoryParams(page));
+    const response = await historyApi.getList(buildHistoryParams(page, allUsers));
     if (requestId !== historyRequestSeq) {
       return null;
     }
@@ -135,11 +156,15 @@ async function fetchHistory(
       set({
         historyItems: response.items,
         currentPage: 1,
+        historyRetentionDays: response.retentionDays,
+        historyAutoCleanupEnabled: response.autoCleanupEnabled,
       });
     } else {
       set({
         historyItems: [...get().historyItems, ...response.items],
         currentPage: page,
+        historyRetentionDays: response.retentionDays,
+        historyAutoCleanupEnabled: response.autoCleanupEnabled,
       });
     }
 
@@ -196,20 +221,20 @@ export const useStockPoolStore = create<StockPoolState>((set, get) => ({
 
   closeMarkdownDrawer: () => set({ markdownDrawerOpen: false }),
 
-  loadInitialHistory: async () => {
-    await fetchHistory(get, set, { autoSelectFirst: true, reset: true });
+  loadInitialHistory: async (options = {}) => {
+    await fetchHistory(get, set, { autoSelectFirst: true, reset: true, allUsers: options.allUsers });
   },
 
-  refreshHistory: async (silent = false) => {
-    await fetchHistory(get, set, { reset: true, silent });
+  refreshHistory: async (silent = false, options = {}) => {
+    await fetchHistory(get, set, { reset: true, silent, allUsers: options.allUsers });
   },
 
-  loadMoreHistory: async () => {
+  loadMoreHistory: async (options = {}) => {
     const state = get();
     if (state.isLoadingMore || !state.hasMore) {
       return;
     }
-    await fetchHistory(get, set, { reset: false });
+    await fetchHistory(get, set, { reset: false, allUsers: options.allUsers });
   },
 
   selectHistoryItem: async (recordId) => {
@@ -305,7 +330,7 @@ export const useStockPoolStore = create<StockPoolState>((set, get) => ({
     const state = get();
     const rawStockCode = options?.stockCode ?? state.query;
     const stockCodeInput = rawStockCode.trim();
-    const stockName = options?.stockName;
+    let stockName = options?.stockName;
     const selectionSource = options?.selectionSource ?? state.selectionSource;
     const originalQuery = (options?.originalQuery ?? state.query).trim();
     const notify = options?.notify ?? state.notify;
@@ -321,8 +346,12 @@ export const useStockPoolStore = create<StockPoolState>((set, get) => ({
       return;
     }
 
-    let normalizedStockCode = stockCodeInput;
-    if (selectionSource === 'autocomplete' || looksLikeStockCode(stockCodeInput)) {
+    const seaAlias = resolveSeaAlias(stockCodeInput);
+    let normalizedStockCode = seaAlias?.stockCode ?? stockCodeInput;
+    if (seaAlias && !stockName) {
+      stockName = seaAlias.stockName;
+    }
+    if (!seaAlias && (selectionSource === 'autocomplete' || looksLikeStockCode(stockCodeInput))) {
       const { valid, message, normalized } = validateStockCode(stockCodeInput);
       if (!valid) {
         set({ inputError: message, duplicateError: null });

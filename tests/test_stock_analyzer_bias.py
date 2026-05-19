@@ -7,6 +7,8 @@ import math
 import unittest
 from unittest.mock import patch, MagicMock
 
+import pandas as pd
+
 from src.stock_analyzer import (
     StockTrendAnalyzer,
     TrendAnalysisResult,
@@ -140,6 +142,31 @@ class StockAnalyzerBiasTestCase(unittest.TestCase):
         )
         self.analyzer._generate_signal(result)
         self._assert_contains(result.risk_factors, "严禁追高")
+
+    def test_analyze_populates_tradingagents_style_indicators(self) -> None:
+        """Trend analysis should expose the broader indicator set used by TradingAgents."""
+        rows = []
+        for i, day in enumerate(pd.date_range("2025-01-01", periods=220, freq="D")):
+            close = 100 + i * 0.2
+            rows.append({
+                "date": day.date().isoformat(),
+                "open": close - 0.5,
+                "high": close + 1.0,
+                "low": close - 1.0,
+                "close": close,
+                "volume": 1_000_000 + i * 1_000,
+            })
+        result = self.analyzer.analyze(pd.DataFrame(rows), "AAPL")
+        payload = result.to_dict()
+
+        self.assertIsNotNone(payload["ema10"])
+        self.assertIsNotNone(payload["ma50"])
+        self.assertIsNotNone(payload["ma200"])
+        self.assertIsNotNone(payload["boll_upper"])
+        self.assertIsNotNone(payload["boll_lower"])
+        self.assertIsNotNone(payload["atr14"])
+        self.assertIsNotNone(payload["vwma20"])
+        self.assertIsNotNone(payload["mfi14"])
 
     @patch("src.stock_analyzer.get_config")
     def test_strong_trend_exceed_effective(self, mock_get_config: MagicMock) -> None:

@@ -6,7 +6,14 @@ export type AuthStatusResponse = {
   passwordSet?: boolean;
   passwordChangeable?: boolean;
   setupState: 'enabled' | 'password_retained' | 'no_password';
+  currentUser?: { id?: number | null; username: string; role: 'admin' | 'user' } | null;
+  registrationEnabled?: boolean;
+  registrationInviteRequired?: boolean;
 };
+
+export type CaptchaResponse = { question: string; captchaToken: string };
+export type AppUser = { id: number; username: string; role: 'admin' | 'user'; status: 'active' | 'disabled'; createdAt?: string | null; lastLoginAt?: string | null };
+export type UserListResponse = { total: number; items: AppUser[] };
 
 export const authApi = {
   async getStatus(): Promise<AuthStatusResponse> {
@@ -39,8 +46,34 @@ export const authApi = {
     return data;
   },
 
-  async login(password: string, passwordConfirm?: string): Promise<void> {
-    const body: { password: string; passwordConfirm?: string } = { password };
+  async getCaptcha(): Promise<CaptchaResponse> {
+    const { data } = await apiClient.get<CaptchaResponse>('/api/v1/auth/captcha');
+    return data;
+  },
+
+  async register(
+    username: string,
+    password: string,
+    passwordConfirm: string,
+    captchaToken: string,
+    captchaAnswer: string,
+    inviteCode?: string
+  ): Promise<void> {
+    await apiClient.post('/api/v1/auth/register', {
+      username,
+      password,
+      passwordConfirm,
+      captchaToken,
+      captchaAnswer,
+      inviteCode,
+    });
+  },
+
+  async login(username: string, password: string, passwordConfirm?: string): Promise<void> {
+    const body: { username?: string; password: string; passwordConfirm?: string } = { password };
+    if (username) {
+      body.username = username;
+    }
     if (passwordConfirm !== undefined) {
       body.passwordConfirm = passwordConfirm;
     }
@@ -57,6 +90,19 @@ export const authApi = {
       newPassword,
       newPasswordConfirm,
     });
+  },
+
+  async listUsers(): Promise<UserListResponse> {
+    const { data } = await apiClient.get<UserListResponse>('/api/v1/auth/users');
+    return data;
+  },
+
+  async updateUser(
+    userId: number,
+    updates: { role?: 'admin' | 'user'; status?: 'active' | 'disabled'; password?: string }
+  ): Promise<{ ok: boolean; user: AppUser }> {
+    const { data } = await apiClient.patch<{ ok: boolean; user: AppUser }>(`/api/v1/auth/users/${userId}`, updates);
+    return data;
   },
 
   async logout(): Promise<void> {

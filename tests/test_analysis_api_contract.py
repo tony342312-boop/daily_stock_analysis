@@ -645,7 +645,7 @@ class AnalysisApiContractTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 202)
         resolve_mock.assert_not_called()
         queue.submit_tasks_batch.assert_called_once_with(
-            stock_codes=["AAPL.US"],
+            stock_codes=["AAPL"],
             stock_name=None,
             original_query="AAPL.US",
             selection_source="manual",

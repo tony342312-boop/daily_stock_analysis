@@ -76,31 +76,126 @@ class TestFundamentalContext(unittest.TestCase):
             circ_mv=4.0e10,
             source=SimpleNamespace(value="tencent"),
         )
-        # Mock get_fundamental_bundle so growth/earnings/institution are not_supported (no network).
-        bundle = {
-            "status": "not_supported",
-            "growth": {},
-            "earnings": {},
-            "institution": {},
-            "source_chain": [],
-            "errors": [],
-        }
         with patch("src.config.get_config", return_value=cfg), \
-                patch.object(manager, "get_realtime_quote", return_value=quote), \
-                patch(
-                    "data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_fundamental_bundle",
-                    return_value=bundle,
-                ):
+                patch.object(manager, "get_realtime_quote", return_value=quote):
             ctx = manager.get_fundamental_context("159915")
         self.assertEqual(ctx["market"], "cn")
+        self.assertEqual(ctx["asset_type"], "etf")
         self.assertIn(ctx["status"], ("partial", "not_supported"))
-        self.assertEqual(ctx["coverage"].get("valuation"), "ok")
+        self.assertEqual(ctx["coverage"].get("valuation"), "partial")
         self.assertEqual(ctx["coverage"].get("growth"), "not_supported")
         self.assertEqual(ctx["coverage"].get("earnings"), "not_supported")
         self.assertEqual(ctx["coverage"].get("institution"), "not_supported")
-        self.assertEqual(ctx["coverage"].get("capital_flow"), "not_supported")
+        self.assertEqual(ctx["coverage"].get("capital_flow"), "partial")
         self.assertEqual(ctx["coverage"].get("dragon_tiger"), "not_supported")
         self.assertEqual(ctx["coverage"].get("boards"), "not_supported")
+
+    def test_us_etf_sec_failure_returns_fund_context(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            sec_edgar_enabled=True,
+            sec_edgar_user_agent="tests@example.com",
+            sec_edgar_timeout_seconds=0.5,
+            fundamental_cache_ttl_seconds=120,
+            fundamental_stage_timeout_seconds=1.5,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+        )
+        quote = SimpleNamespace(
+            code="DRAM",
+            name="Roundhill Memory ETF",
+            price=51.1,
+            change_pct=0.4,
+            source=SimpleNamespace(value="longbridge"),
+        )
+        with patch("src.config.get_config", return_value=cfg), \
+                patch("data_provider.sec_edgar.SecEdgarClient.get_company_context",
+                      side_effect=RuntimeError("ticker not found in SEC company_tickers.json: DRAM")), \
+                patch.object(manager, "get_realtime_quote", return_value=quote):
+            ctx = manager.get_fundamental_context("DRAM.US")
+
+        self.assertEqual(ctx["market"], "us")
+        self.assertEqual(ctx["asset_type"], "etf")
+        self.assertEqual(ctx["status"], "partial")
+        self.assertEqual(ctx["coverage"].get("valuation"), "partial")
+        self.assertEqual(ctx["coverage"].get("earnings"), "not_supported")
+        self.assertFalse(ctx["fund_profile"]["company_financial_report_applicable"])
+        self.assertEqual(ctx["earnings"]["data"]["financial_report"]["source"], "not_applicable")
+
+    def test_us_fundamental_context_uses_sec_and_quote_only(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            sec_edgar_enabled=True,
+            sec_edgar_user_agent="tests@example.com",
+            sec_edgar_timeout_seconds=0.5,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+            fred_enabled=False,
+            peer_valuation_enabled=False,
+        )
+        sec_payload = {
+            "provider": "SEC EDGAR",
+            "status": "ok",
+            "cik": "1326801",
+            "company_name": "Meta Platforms, Inc.",
+            "financial_report": {
+                "source": "SEC EDGAR companyfacts",
+                "quarterly_trend": [{"fy": 2025, "fp": "Q4", "revenue": 48000000000}],
+                "annual_trend": [{"fy": 2025, "revenue": 160000000000}],
+            },
+            "dividend": {},
+            "source_chain": [{"provider": "sec_edgar", "result": "ok", "duration_ms": 1}],
+        }
+        quote = SimpleNamespace(
+            code="META",
+            name="Meta",
+            price=614.23,
+            pe_ratio=28.0,
+            pb_ratio=9.0,
+            total_mv=1.5e12,
+            circ_mv=1.5e12,
+            source=SimpleNamespace(value="longbridge"),
+        )
+        with patch("src.config.get_config", return_value=cfg), \
+                patch("data_provider.sec_edgar.SecEdgarClient.get_company_context", return_value=sec_payload), \
+                patch.object(manager, "get_realtime_quote", return_value=quote):
+            ctx = manager.get_fundamental_context("META")
+
+        self.assertEqual(ctx["market"], "us")
+        self.assertEqual(ctx["coverage"].get("quote"), "ok")
+        self.assertEqual(ctx["valuation"]["status"], "ok")
+        self.assertEqual(ctx["growth"]["status"], "partial")
+        self.assertEqual(ctx["earnings"]["status"], "ok")
+
+    def test_hk_fundamental_context_uses_realtime_quote(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+            peer_valuation_enabled=False,
+        )
+        quote = SimpleNamespace(
+            code="HK00700",
+            name="Tencent",
+            price=400.0,
+            pe_ratio=20.0,
+            pb_ratio=4.0,
+            total_mv=3.8e12,
+            circ_mv=3.7e12,
+            source=SimpleNamespace(value="longbridge"),
+        )
+        with patch("src.config.get_config", return_value=cfg), \
+                patch.object(manager, "get_realtime_quote", return_value=quote):
+            ctx = manager.get_fundamental_context("00700.HK")
+
+        self.assertEqual(ctx["market"], "hk")
+        self.assertEqual(ctx["status"], "partial")
+        self.assertEqual(ctx["coverage"].get("valuation"), "ok")
+        self.assertEqual(ctx["earnings"]["status"], "not_supported")
+        self.assertEqual(ctx["valuation"]["data"]["quote"]["name"], "Tencent")
 
     def test_sector_rankings_use_ordered_fallback(self) -> None:
         akshare = _DummyFetcher("AkshareFetcher", priority=5, rankings=None)

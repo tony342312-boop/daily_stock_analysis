@@ -57,6 +57,7 @@ describe('LoginPage', () => {
 
     render(<LoginPage />);
 
+    fireEvent.change(screen.getByLabelText('用户名'), { target: { value: 'alice' } });
     fireEvent.change(screen.getByLabelText('登录密码'), { target: { value: 'passwd6' } });
     fireEvent.click(screen.getByRole('button', { name: '授权进入工作台' }));
 

@@ -35,6 +35,7 @@ export const ReportMarkdown: React.FC<ReportMarkdownProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [isOpen, setIsOpen] = useState(true);
   const [copiedType, setCopiedType] = useState<'markdown' | 'text' | null>(null);
+  const [isDownloadingPdf, setIsDownloadingPdf] = useState(false);
 
   // Handle close with animation
   const handleClose = useCallback(() => {
@@ -67,6 +68,36 @@ export const ReportMarkdown: React.FC<ReportMarkdownProps> = ({
       console.error('Copy failed:', error);
     }
   }, [content]);
+
+  const handleDownloadPdf = useCallback(async () => {
+    if (!content) return;
+
+    setIsDownloadingPdf(true);
+    setError(null);
+
+    try {
+      const pdfBlob = await historyApi.downloadPdf(recordId);
+      const downloadUrl = URL.createObjectURL(pdfBlob);
+      const anchor = document.createElement('a');
+      const safeName = `${stockName || stockCode || 'analysis'}_${stockCode || recordId}`
+        .replace(/[\\/:*?"<>|]+/g, '_')
+        .replace(/\s+/g, '_')
+        .slice(0, 90);
+
+      anchor.href = downloadUrl;
+      anchor.download = `${safeName || `analysis_${recordId}`}_report.pdf`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+
+      window.setTimeout(() => URL.revokeObjectURL(downloadUrl), 1_000);
+    } catch (err) {
+      console.error('PDF download failed:', err);
+      setError(err instanceof Error ? err.message : text.downloadPdfFailed);
+    } finally {
+      setIsDownloadingPdf(false);
+    }
+  }, [content, recordId, stockCode, stockName, text.downloadPdfFailed]);
 
   useEffect(() => {
     let isMounted = true;
@@ -122,6 +153,27 @@ export const ReportMarkdown: React.FC<ReportMarkdownProps> = ({
 
         {/* Right: Toolbar */}
         <div className="flex items-center gap-2">
+          {/* Download PDF button */}
+          <Tooltip content={isDownloadingPdf ? text.downloadingPdf : text.downloadPdf}>
+            <span className="inline-flex">
+              <button
+                type="button"
+                onClick={handleDownloadPdf}
+                disabled={isLoading || !content || isDownloadingPdf}
+                className="home-surface-button flex h-10 w-10 items-center justify-center rounded-lg text-secondary-text hover:text-foreground disabled:opacity-50"
+                aria-label={text.downloadPdf}
+              >
+                {isDownloadingPdf ? (
+                  <span className="home-spinner h-5 w-5 animate-spin border-2" aria-hidden="true" />
+                ) : (
+                  <svg className="h-6 w-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v10m0 0l4-4m-4 4l-4-4M5 20h14" />
+                  </svg>
+                )}
+              </button>
+            </span>
+          </Tooltip>
+
           {/* Copy Markdown button */}
           <Tooltip content={text.copyMarkdownSource}>
             <span className="inline-flex">

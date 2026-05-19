@@ -1,0 +1,24 @@
+[Unit]
+Description=Daily Stock Analysis WebUI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dsa
+Group=dsa
+WorkingDirectory=/opt/daily_stock_analysis
+EnvironmentFile=/opt/daily_stock_analysis/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=WEBUI_BIND_HOST=127.0.0.1
+Environment=WEBUI_BIND_PORT=8000
+Environment=PYTHON_BIN=/opt/miniconda3/envs/daily_stock_analysis/bin/python
+ExecStart=/opt/daily_stock_analysis/scripts/start-webui-server.sh
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+

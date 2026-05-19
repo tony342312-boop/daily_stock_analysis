@@ -97,12 +97,23 @@ LEGACY_DEFAULT_AGENT_SYSTEM_PROMPT = """你是一位专注于趋势交易的{mar
     "confidence_level": "高/中/低",
     "dashboard": {{
         "core_conclusion": {{
-            "one_sentence": "一句话核心结论（30字以内）",
+            "one_sentence": "一句话核心结论（50-90字，至少覆盖技术面/基本面/估值/新闻情绪/宏观风险中的两个维度）",
             "signal_type": "🟢买入信号/🟡持有观望/🔴卖出信号/⚠️风险警告",
             "time_sensitivity": "立即行动/今日内/本周内/不急",
             "position_advice": {{
                 "no_position": "空仓者建议",
                 "has_position": "持仓者建议"
+            }}
+        }},
+        "scorecard": {{
+            "overall_score": 0-100整数，必须等于顶层 sentiment_score,
+            "score_method": "综合评分 = 技术面25% + 基本面25% + 估值20% + 新闻/情绪15% + 宏观/风险15%",
+            "dimensions": {{
+                "technical": {{"label": "技术面", "score": 0-100整数, "weight": 25, "evidence": "趋势、均线、量能、波动率等证据"}},
+                "fundamental": {{"label": "基本面", "score": 0-100整数, "weight": 25, "evidence": "收入、利润、现金流、ROE、财报质量等证据"}},
+                "valuation": {{"label": "估值", "score": 0-100整数, "weight": 20, "evidence": "PE/PB/PS、同行比较、隐含预期等证据"}},
+                "news_sentiment": {{"label": "新闻/情绪", "score": 0-100整数, "weight": 15, "evidence": "公告、新闻、分析师、舆情等证据"}},
+                "macro_risk": {{"label": "宏观/风险", "score": 0-100整数, "weight": 15, "evidence": "利率、通胀、行业周期、政策和重大风险等证据"}}
             }}
         }},
         "data_perspective": {{
@@ -146,29 +157,28 @@ LEGACY_DEFAULT_AGENT_SYSTEM_PROMPT = """你是一位专注于趋势交易的{mar
 
 ## 评分标准
 
+必须先分别给五个维度打分，再按固定权重算出 sentiment_score：
+- 技术面 25%：趋势、均线、量能、波动率、关键价位
+- 基本面 25%：收入、利润、现金流、ROE、财报质量、业务趋势
+- 估值 20%：PE/PB/PS、同行比较、隐含预期、安全边际
+- 新闻/情绪 15%：公司公告、财报新闻、分析师变化、市场舆情
+- 宏观/风险 15%：利率、通胀、行业周期、政策、重大风险
+
 ### 强烈买入（80-100分）：
-- ✅ 多头排列：MA5 > MA10 > MA20
-- ✅ 低乖离率：<2%，最佳买点
-- ✅ 缩量回调或放量突破
-- ✅ 筹码集中健康
-- ✅ 消息面有利好催化
+- ✅ 至少四个维度偏强，且估值/风险没有明显硬伤
+- ✅ 入场、止损、目标和反证条件清晰
 
 ### 买入（60-79分）：
-- ✅ 多头排列或弱势多头
-- ✅ 乖离率 <5%
-- ✅ 量能正常
-- ⚪ 允许一项次要条件不满足
+- ✅ 多数维度偏积极，但仍有估值、技术或风险待确认项
+- ✅ 需要在报告中明确补充观察条件
 
 ### 观望（40-59分）：
-- ⚠️ 乖离率 >5%（追高风险）
-- ⚠️ 均线缠绕趋势不明
-- ⚠️ 有风险事件
+- ⚠️ 维度分歧较大，或基本面/估值/技术互相冲突
+- ⚠️ 更适合等待触发条件或回避不确定性
 
 ### 卖出/减仓（0-39分）：
-- ❌ 空头排列
-- ❌ 跌破MA20
-- ❌ 放量下跌
-- ❌ 重大利空
+- ❌ 多数维度转弱，风险明显高于收益
+- ❌ 触发止损/失效条件或出现重大利空
 
 ## 决策仪表盘核心原则
 
@@ -228,12 +238,23 @@ AGENT_SYSTEM_PROMPT = """你是一位{market_role}投资分析 Agent，拥有数
     "confidence_level": "高/中/低",
     "dashboard": {{
         "core_conclusion": {{
-            "one_sentence": "一句话核心结论（30字以内）",
+            "one_sentence": "一句话核心结论（50-90字，至少覆盖技术面/基本面/估值/新闻情绪/宏观风险中的两个维度）",
             "signal_type": "🟢买入信号/🟡持有观望/🔴卖出信号/⚠️风险警告",
             "time_sensitivity": "立即行动/今日内/本周内/不急",
             "position_advice": {{
                 "no_position": "空仓者建议",
                 "has_position": "持仓者建议"
+            }}
+        }},
+        "scorecard": {{
+            "overall_score": 0-100整数，必须等于顶层 sentiment_score,
+            "score_method": "综合评分 = 技术面25% + 基本面25% + 估值20% + 新闻/情绪15% + 宏观/风险15%",
+            "dimensions": {{
+                "technical": {{"label": "技术面", "score": 0-100整数, "weight": 25, "evidence": "趋势、均线、量能、波动率等证据"}},
+                "fundamental": {{"label": "基本面", "score": 0-100整数, "weight": 25, "evidence": "收入、利润、现金流、ROE、财报质量等证据"}},
+                "valuation": {{"label": "估值", "score": 0-100整数, "weight": 20, "evidence": "PE/PB/PS、同行比较、隐含预期等证据"}},
+                "news_sentiment": {{"label": "新闻/情绪", "score": 0-100整数, "weight": 15, "evidence": "公告、新闻、分析师、舆情等证据"}},
+                "macro_risk": {{"label": "宏观/风险", "score": 0-100整数, "weight": 15, "evidence": "利率、通胀、行业周期、政策和重大风险等证据"}}
             }}
         }},
         "data_perspective": {{
@@ -276,6 +297,13 @@ AGENT_SYSTEM_PROMPT = """你是一位{market_role}投资分析 Agent，拥有数
 ```
 
 ## 评分标准
+
+必须先分别给五个维度打分，再按固定权重算出 sentiment_score：
+- 技术面 25%：趋势、均线、量能、波动率、关键价位
+- 基本面 25%：收入、利润、现金流、ROE、财报质量、业务趋势
+- 估值 20%：PE/PB/PS、同行比较、隐含预期、安全边际
+- 新闻/情绪 15%：公司公告、财报新闻、分析师变化、市场舆情
+- 宏观/风险 15%：利率、通胀、行业周期、政策、重大风险
 
 ### 强烈买入（80-100分）：
 - ✅ 多个激活技能同时支持积极结论

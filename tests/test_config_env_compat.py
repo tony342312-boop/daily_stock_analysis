@@ -11,6 +11,9 @@ from src.config import Config, setup_env
 
 
 class ConfigEnvCompatibilityTestCase(unittest.TestCase):
+    def setUp(self):
+        Config.reset_instance()
+
     def tearDown(self):
         Config.reset_instance()
 

@@ -13,6 +13,9 @@ interface HistoryListProps {
   selectedId?: number;  // 当前选中的历史记录 ID
   selectedIds: Set<number>;
   isDeleting?: boolean;
+  isAdminView?: boolean;
+  retentionDays?: number;
+  autoCleanupEnabled?: boolean;
   onItemClick: (recordId: number) => void;  // 点击记录的回调
   onLoadMore: () => void;
   onToggleItemSelection: (recordId: number) => void;
@@ -33,6 +36,9 @@ export const HistoryList: React.FC<HistoryListProps> = ({
   selectedId,
   selectedIds,
   isDeleting = false,
+  isAdminView = false,
+  retentionDays,
+  autoCleanupEnabled,
   onItemClick,
   onLoadMore,
   onToggleItemSelection,
@@ -94,7 +100,7 @@ export const HistoryList: React.FC<HistoryListProps> = ({
         <div className="mb-4 space-y-3">
           <DashboardPanelHeader
             className="mb-1"
-            title="历史分析"
+            title={isAdminView ? "全部用户查询记录" : "历史分析"}
             titleClassName="text-sm font-medium"
             leading={(
               <svg className="h-4 w-4 text-primary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -107,9 +113,17 @@ export const HistoryList: React.FC<HistoryListProps> = ({
                 <Badge variant="info" size="sm" className="history-selection-badge animate-in fade-in zoom-in duration-200">
                   已选 {selectedCount}
                 </Badge>
+              ) : isAdminView ? (
+                <Badge variant="warning" size="sm">管理员</Badge>
               ) : undefined
             }
           />
+
+          {autoCleanupEnabled && retentionDays ? (
+            <div className="rounded-lg border border-[var(--settings-border)] bg-background/30 px-2.5 py-2 text-[11px] leading-5 text-muted-text">
+              历史记录自动保留最近 {retentionDays} 天，过期记录会由服务器清理。
+            </div>
+          ) : null}
 
           {items.length > 0 && (
             <div className="flex items-center gap-2">
@@ -168,6 +182,7 @@ export const HistoryList: React.FC<HistoryListProps> = ({
                 isViewing={selectedId === item.id}
                 isChecked={selectedIds.has(item.id)}
                 isDeleting={isDeleting}
+                showUser={isAdminView}
                 onToggleChecked={onToggleItemSelection}
                 onClick={onItemClick}
               />

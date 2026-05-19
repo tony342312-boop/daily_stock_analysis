@@ -261,8 +261,421 @@ def _extract_latest_row(df: pd.DataFrame, stock_code: str) -> Optional[pd.Series
     return df.iloc[0]
 
 
+_A_SHARE_FINANCIAL_SOURCE = "AkShare Sina 财务报表"
+
+
+def _safe_number(value: Any) -> Optional[float]:
+    parsed = _safe_float(value)
+    if parsed is None:
+        return None
+    try:
+        if pd.isna(parsed):
+            return None
+    except Exception:
+        pass
+    return float(parsed)
+
+
+def _to_sina_stock_symbol(stock_code: str) -> str:
+    code = _normalize_code(stock_code)
+    if not code:
+        return _safe_str(stock_code).lower()
+    if code.startswith(("6", "9")):
+        return f"sh{code}"
+    if code.startswith(("0", "2", "3")):
+        return f"sz{code}"
+    if code.startswith(("4", "8")):
+        return f"bj{code}"
+    return code.lower()
+
+
+def _format_cny_amount(value: Any) -> str:
+    amount = _safe_number(value)
+    if amount is None:
+        return "N/A"
+    sign = "-" if amount < 0 else ""
+    abs_amount = abs(amount)
+    if abs_amount >= 1e8:
+        text = f"{abs_amount / 1e8:.2f}亿"
+    elif abs_amount >= 1e4:
+        text = f"{abs_amount / 1e4:.2f}万"
+    else:
+        text = f"{abs_amount:.2f}"
+    return f"{sign}¥{text}"
+
+
+def _format_ratio(value: Any) -> str:
+    ratio = _safe_number(value)
+    return "N/A" if ratio is None else f"{ratio:.2f}%"
+
+
+def _format_eps(value: Any) -> str:
+    eps = _safe_number(value)
+    return "N/A" if eps is None else f"{eps:.2f}"
+
+
+def _pick_exact(row: Optional[pd.Series], columns: List[str]) -> Optional[Any]:
+    if row is None:
+        return None
+    for col in columns:
+        if col in row.index:
+            value = row.get(col)
+            if value is not None and str(value).strip() not in ("", "-", "nan", "None"):
+                return value
+    return None
+
+
+def _row_number(row: Optional[pd.Series], columns: List[str]) -> Optional[float]:
+    return _safe_number(_pick_exact(row, columns))
+
+
+def _prepare_sina_report_frame(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    date_col = next(
+        (
+            col
+            for col in df.columns
+            if str(col) in ("报告日", "报告日期", "报告期", "截止日期")
+            or any(key in str(col) for key in ("报告日", "报告期", "截止日期"))
+        ),
+        None,
+    )
+    if date_col is None:
+        return pd.DataFrame()
+    work_df = df.copy()
+    work_df["_report_dt"] = work_df[date_col].map(_safe_datetime)
+    work_df = work_df.dropna(subset=["_report_dt"]).copy()
+    if work_df.empty:
+        return pd.DataFrame()
+    work_df = work_df.sort_values("_report_dt", ascending=False).reset_index(drop=True)
+    return work_df
+
+
+def _date_key(value: datetime) -> str:
+    return value.date().isoformat()
+
+
+def _quarter_of(value: datetime) -> int:
+    return (value.month - 1) // 3 + 1
+
+
+def _quarter_period(value: datetime) -> str:
+    return f"{value.year}Q{_quarter_of(value)}"
+
+
+def _annual_period(value: datetime) -> str:
+    return f"{value.year}"
+
+
+def _calc_change_pct(current: Optional[float], previous: Optional[float]) -> Optional[float]:
+    if current is None or previous is None or previous == 0:
+        return None
+    return round((current - previous) / abs(previous) * 100.0, 4)
+
+
+def _safe_margin_pct(profit: Optional[float], revenue: Optional[float]) -> Optional[float]:
+    if profit is None or revenue in (None, 0):
+        return None
+    return round(profit / revenue * 100.0, 4)
+
+
+def _sum_optional(values: List[Optional[float]]) -> Optional[float]:
+    available = [value for value in values if value is not None]
+    if not available:
+        return None
+    return float(sum(available))
+
+
+def _value_for_quarter(
+    rows_by_yq: Dict[Tuple[int, int], pd.Series],
+    year: int,
+    quarter: int,
+    columns: List[str],
+) -> Tuple[Optional[float], bool, str]:
+    current_row = rows_by_yq.get((year, quarter))
+    current = _row_number(current_row, columns)
+    if current is None:
+        return None, False, ""
+    if quarter <= 1:
+        return current, False, "单季"
+    previous = _row_number(rows_by_yq.get((year, quarter - 1)), columns)
+    if previous is None:
+        return current, False, "累计；缺前序季度，未拆单季"
+    return current - previous, True, "由累计值相减得出单季值"
+
+
+def _build_a_share_financial_report_from_sina_frames(
+    profit_df: Optional[pd.DataFrame],
+    balance_df: Optional[pd.DataFrame],
+    cash_df: Optional[pd.DataFrame],
+) -> Dict[str, Any]:
+    """Build a SEC-like financial report payload from A-share Sina statements."""
+    profit = _prepare_sina_report_frame(profit_df)
+    balance = _prepare_sina_report_frame(balance_df)
+    cash = _prepare_sina_report_frame(cash_df)
+    if profit.empty and balance.empty and cash.empty:
+        return {}
+
+    profit_by_key = {_date_key(row["_report_dt"]): row for _, row in profit.iterrows()}
+    cash_by_key = {_date_key(row["_report_dt"]): row for _, row in cash.iterrows()}
+    balance_by_key = {_date_key(row["_report_dt"]): row for _, row in balance.iterrows()}
+    profit_by_yq = {
+        (row["_report_dt"].year, _quarter_of(row["_report_dt"])): row
+        for _, row in profit.iterrows()
+    }
+    cash_by_yq = {
+        (row["_report_dt"].year, _quarter_of(row["_report_dt"])): row
+        for _, row in cash.iterrows()
+    }
+
+    revenue_cols = ["营业总收入", "营业收入"]
+    net_profit_cols = ["归属于母公司所有者的净利润", "归属于母公司股东的净利润", "净利润"]
+    eps_cols = ["稀释每股收益", "基本每股收益"]
+    ocf_cols = ["经营活动产生的现金流量净额"]
+    capex_cols = ["购建固定资产、无形资产和其他长期资产所支付的现金"]
+    assets_cols = ["资产总计"]
+    liabilities_cols = ["负债合计"]
+    equity_cols = ["归属于母公司股东权益合计", "所有者权益(或股东权益)合计", "股东权益合计"]
+    liquid_cols = ["货币资金", "交易性金融资产", "衍生金融资产"]
+    debt_cols = ["短期借款", "一年内到期的非流动负债", "长期借款", "应付债券", "租赁负债"]
+
+    dates = sorted(
+        {row["_report_dt"] for _, row in profit.iterrows()}
+        | {row["_report_dt"] for _, row in cash.iterrows()}
+        | {row["_report_dt"] for _, row in balance.iterrows()},
+        reverse=True,
+    )
+    if not dates:
+        return {}
+
+    def _balance_row_for(dt: datetime) -> Optional[pd.Series]:
+        key = _date_key(dt)
+        if key in balance_by_key:
+            return balance_by_key[key]
+        for _, row in balance.iterrows():
+            if row["_report_dt"] <= dt:
+                return row
+        return balance.iloc[0] if not balance.empty else None
+
+    quarterly_rows: List[Dict[str, Any]] = []
+    for dt in dates:
+        quarter = _quarter_of(dt)
+        if quarter not in (1, 2, 3, 4):
+            continue
+        year = dt.year
+        revenue, revenue_derived, revenue_note = _value_for_quarter(profit_by_yq, year, quarter, revenue_cols)
+        net_profit, profit_derived, profit_note = _value_for_quarter(profit_by_yq, year, quarter, net_profit_cols)
+        ocf, ocf_derived, ocf_note = _value_for_quarter(cash_by_yq, year, quarter, ocf_cols)
+        capex, capex_derived, capex_note = _value_for_quarter(cash_by_yq, year, quarter, capex_cols)
+        fcf = ocf - capex if ocf is not None and capex is not None else None
+        profit_row = profit_by_key.get(_date_key(dt))
+        filing_date = _normalize_report_date(_pick_exact(profit_row, ["公告日期", "更新日期"]))
+        net_margin = _safe_margin_pct(net_profit, revenue)
+        eps = _row_number(profit_row, eps_cols)
+        row: Dict[str, Any] = {
+            "period": _quarter_period(dt),
+            "report_date": dt.date().isoformat(),
+            "filing_date": filing_date,
+            "revenue": _format_cny_amount(revenue),
+            "revenue_value": revenue,
+            "revenue_period": revenue_note,
+            "net_profit_parent": _format_cny_amount(net_profit),
+            "net_profit_parent_value": net_profit,
+            "net_profit_parent_period": profit_note,
+            "operating_cash_flow": _format_cny_amount(ocf),
+            "operating_cash_flow_value": ocf,
+            "operating_cash_flow_period": ocf_note,
+            "capital_expenditure": _format_cny_amount(capex),
+            "capital_expenditure_value": capex,
+            "capital_expenditure_period": capex_note,
+            "free_cash_flow": _format_cny_amount(fcf),
+            "free_cash_flow_value": fcf,
+            "net_margin_pct": net_margin,
+            "eps_diluted": _format_eps(eps),
+            "eps_diluted_value": eps,
+            "derived": bool(revenue_derived or profit_derived or ocf_derived or capex_derived),
+            "source": _A_SHARE_FINANCIAL_SOURCE,
+        }
+        if any(row.get(k) is not None for k in ("revenue_value", "net_profit_parent_value", "operating_cash_flow_value")):
+            quarterly_rows.append(row)
+
+    quarterly_rows.sort(key=lambda row: row.get("report_date") or "", reverse=True)
+    by_quarter = {
+        (int(str(row["period"])[:4]), int(str(row["period"]).split("Q")[-1])): row
+        for row in quarterly_rows
+        if isinstance(row.get("period"), str) and "Q" in str(row.get("period"))
+    }
+    for index, row in enumerate(quarterly_rows):
+        older = quarterly_rows[index + 1] if index + 1 < len(quarterly_rows) else {}
+        year = int(str(row["period"])[:4])
+        quarter = int(str(row["period"]).split("Q")[-1])
+        yoy = by_quarter.get((year - 1, quarter), {})
+        row["revenue_value_change_pct"] = _calc_change_pct(row.get("revenue_value"), older.get("revenue_value"))
+        row["revenue_value_yoy_pct"] = _calc_change_pct(row.get("revenue_value"), yoy.get("revenue_value"))
+        row["net_profit_parent_value_change_pct"] = _calc_change_pct(
+            row.get("net_profit_parent_value"),
+            older.get("net_profit_parent_value"),
+        )
+        row["net_profit_parent_value_yoy_pct"] = _calc_change_pct(
+            row.get("net_profit_parent_value"),
+            yoy.get("net_profit_parent_value"),
+        )
+
+    annual_rows: List[Dict[str, Any]] = []
+    for dt in dates:
+        if dt.month != 12:
+            continue
+        key = _date_key(dt)
+        profit_row = profit_by_key.get(key)
+        cash_row = cash_by_key.get(key)
+        revenue = _row_number(profit_row, revenue_cols)
+        net_profit = _row_number(profit_row, net_profit_cols)
+        ocf = _row_number(cash_row, ocf_cols)
+        capex = _row_number(cash_row, capex_cols)
+        fcf = ocf - capex if ocf is not None and capex is not None else None
+        eps = _row_number(profit_row, eps_cols)
+        row = {
+            "period": _annual_period(dt),
+            "report_date": dt.date().isoformat(),
+            "filing_date": _normalize_report_date(_pick_exact(profit_row, ["公告日期", "更新日期"])),
+            "revenue": _format_cny_amount(revenue),
+            "revenue_value": revenue,
+            "net_profit_parent": _format_cny_amount(net_profit),
+            "net_profit_parent_value": net_profit,
+            "operating_cash_flow": _format_cny_amount(ocf),
+            "operating_cash_flow_value": ocf,
+            "capital_expenditure": _format_cny_amount(capex),
+            "capital_expenditure_value": capex,
+            "free_cash_flow": _format_cny_amount(fcf),
+            "free_cash_flow_value": fcf,
+            "net_margin_pct": _safe_margin_pct(net_profit, revenue),
+            "eps_diluted": _format_eps(eps),
+            "eps_diluted_value": eps,
+            "source": _A_SHARE_FINANCIAL_SOURCE,
+        }
+        if any(row.get(k) is not None for k in ("revenue_value", "net_profit_parent_value", "operating_cash_flow_value")):
+            annual_rows.append(row)
+
+    annual_rows.sort(key=lambda row: row.get("report_date") or "", reverse=True)
+    for index, row in enumerate(annual_rows):
+        older = annual_rows[index + 1] if index + 1 < len(annual_rows) else {}
+        row["revenue_value_change_pct"] = _calc_change_pct(row.get("revenue_value"), older.get("revenue_value"))
+        row["net_profit_parent_value_change_pct"] = _calc_change_pct(
+            row.get("net_profit_parent_value"),
+            older.get("net_profit_parent_value"),
+        )
+
+    latest = quarterly_rows[0] if quarterly_rows else {}
+    latest_dt = _safe_datetime(latest.get("report_date")) if latest else dates[0]
+    latest_balance = _balance_row_for(latest_dt or dates[0])
+    assets = _row_number(latest_balance, assets_cols)
+    liabilities = _row_number(latest_balance, liabilities_cols)
+    equity = _row_number(latest_balance, equity_cols)
+    liquid_assets = _sum_optional([_row_number(latest_balance, [col]) for col in liquid_cols])
+    interest_bearing_debt = _sum_optional([_row_number(latest_balance, [col]) for col in debt_cols])
+    net_cash = (
+        liquid_assets - interest_bearing_debt
+        if liquid_assets is not None and interest_bearing_debt is not None
+        else None
+    )
+    debt_to_assets = _safe_margin_pct(liabilities, assets)
+    equity_ratio = _safe_margin_pct(equity, assets)
+    asset_to_equity = round(assets / equity, 4) if assets is not None and equity not in (None, 0) else None
+    roe_value = None
+    if annual_rows:
+        annual_report_date = str(annual_rows[0].get("report_date") or "")
+        annual_balance = balance_by_key.get(annual_report_date)
+        if annual_balance is None:
+            annual_balance = latest_balance
+        annual_equity = _row_number(annual_balance, equity_cols)
+        annual_profit = annual_rows[0].get("net_profit_parent_value")
+        if annual_profit is not None and annual_equity not in (None, 0):
+            roe_value = round(float(annual_profit) / float(annual_equity) * 100.0, 4)
+
+    report: Dict[str, Any] = {
+        "form": "A股财报",
+        "source": _A_SHARE_FINANCIAL_SOURCE,
+        "report_date": latest.get("report_date") or dates[0].date().isoformat(),
+        "filing_date": latest.get("filing_date"),
+        "revenue": latest.get("revenue"),
+        "revenue_value": latest.get("revenue_value"),
+        "revenue_period": latest.get("revenue_period") or "单季/累计口径见趋势表",
+        "net_profit_parent": latest.get("net_profit_parent"),
+        "net_profit_parent_value": latest.get("net_profit_parent_value"),
+        "net_profit_parent_period": latest.get("net_profit_parent_period") or "单季/累计口径见趋势表",
+        "operating_cash_flow": latest.get("operating_cash_flow"),
+        "operating_cash_flow_value": latest.get("operating_cash_flow_value"),
+        "operating_cash_flow_period": latest.get("operating_cash_flow_period") or "单季/累计口径见趋势表",
+        "capital_expenditure": latest.get("capital_expenditure"),
+        "capital_expenditure_value": latest.get("capital_expenditure_value"),
+        "free_cash_flow": latest.get("free_cash_flow"),
+        "free_cash_flow_value": latest.get("free_cash_flow_value"),
+        "net_margin_pct": latest.get("net_margin_pct"),
+        "roe": _format_ratio(roe_value),
+        "roe_value": roe_value,
+        "roe_note": f"最近完整年度归母净利润 / 股东权益，{_A_SHARE_FINANCIAL_SOURCE} 推算" if roe_value is not None else "N/A",
+        "eps_diluted": latest.get("eps_diluted"),
+        "eps_diluted_value": latest.get("eps_diluted_value"),
+        "assets": _format_cny_amount(assets),
+        "assets_value": assets,
+        "liabilities": _format_cny_amount(liabilities),
+        "liabilities_value": liabilities,
+        "shareholders_equity": _format_cny_amount(equity),
+        "shareholders_equity_value": equity,
+        "debt_to_assets_pct": _format_ratio(debt_to_assets),
+        "equity_ratio_pct": _format_ratio(equity_ratio),
+        "asset_to_equity": asset_to_equity,
+        "liquid_assets": _format_cny_amount(liquid_assets),
+        "liquid_assets_value": liquid_assets,
+        "interest_bearing_debt": _format_cny_amount(interest_bearing_debt),
+        "interest_bearing_debt_value": interest_bearing_debt,
+        "net_cash": _format_cny_amount(net_cash),
+        "net_cash_value": net_cash,
+        "quarterly_trend": quarterly_rows[:6],
+        "annual_trend": annual_rows[:5],
+    }
+    if report.get("operating_cash_flow_value") is not None and report.get("net_profit_parent_value") not in (None, 0):
+        report["operating_cash_flow_to_net_income_pct"] = round(
+            report["operating_cash_flow_value"] / report["net_profit_parent_value"] * 100.0,
+            4,
+        )
+    if report.get("free_cash_flow_value") is not None and report.get("net_profit_parent_value") not in (None, 0):
+        report["free_cash_flow_to_net_income_pct"] = round(
+            report["free_cash_flow_value"] / report["net_profit_parent_value"] * 100.0,
+            4,
+        )
+    return report
+
+
 class AkshareFundamentalAdapter:
     """AkShare adapter for fundamentals, capital flow and dragon-tiger signals."""
+
+    def _build_sina_financial_report(self, stock_code: str) -> Tuple[Dict[str, Any], List[str]]:
+        errors: List[str] = []
+        try:
+            import akshare as ak
+        except Exception as exc:
+            return {}, [f"import_akshare:{type(exc).__name__}"]
+
+        symbol = _to_sina_stock_symbol(stock_code)
+        frames: Dict[str, Optional[pd.DataFrame]] = {"利润表": None, "资产负债表": None, "现金流量表": None}
+        for statement in list(frames.keys()):
+            try:
+                df = ak.stock_financial_report_sina(stock=symbol, symbol=statement)
+                if isinstance(df, pd.Series):
+                    df = df.to_frame().T
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    frames[statement] = df
+            except Exception as exc:
+                errors.append(f"stock_financial_report_sina:{statement}:{type(exc).__name__}")
+
+        report = _build_a_share_financial_report_from_sina_frames(
+            frames.get("利润表"),
+            frames.get("资产负债表"),
+            frames.get("现金流量表"),
+        )
+        return report, errors
 
     def _call_df_candidates(
         self,
@@ -301,6 +714,28 @@ class AkshareFundamentalAdapter:
             "source_chain": [],
             "errors": [],
         }
+
+        # Prefer structured A-share statements first. Some legacy AkShare
+        # endpoints below are useful but slow/fragile; returning the statement
+        # payload early keeps the WebUI from losing all fundamental data on
+        # timeout.
+        sina_report, sina_errors = self._build_sina_financial_report(stock_code)
+        result["errors"].extend(sina_errors)
+        if sina_report:
+            result["earnings"]["financial_report"] = sina_report
+            latest_quarter = {}
+            quarterly = sina_report.get("quarterly_trend")
+            if isinstance(quarterly, list) and quarterly:
+                latest_quarter = quarterly[0] if isinstance(quarterly[0], dict) else {}
+            result["growth"] = {
+                "revenue_yoy": latest_quarter.get("revenue_value_yoy_pct"),
+                "net_profit_yoy": latest_quarter.get("net_profit_parent_value_yoy_pct"),
+                "roe": sina_report.get("roe"),
+                "gross_margin": None,
+            }
+            result["source_chain"].append("financial_report:stock_financial_report_sina")
+            result["status"] = "partial"
+            return result
 
         # Financial indicators
         fin_df, fin_source, fin_errors = self._call_df_candidates([

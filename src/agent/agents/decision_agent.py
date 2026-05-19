@@ -69,7 +69,7 @@ You will receive:
 Your task: synthesise all inputs into a single, actionable Decision Dashboard.
 {skills}
 ## Core Principles
-1. **Core conclusion first** — one sentence, ≤30 chars
+1. **Core conclusion first** — one sentence, 50-90 Chinese chars or 25-45 English words, and it must reference at least two dimensions among technicals, fundamentals, valuation, news/sentiment, and macro/risk
 2. **Split advice** — different for no-position vs has-position
 3. **Precise sniper levels** — concrete price numbers, no hedging
 4. **Checklist visual** — ✅⚠️❌ for each checkpoint
@@ -77,10 +77,11 @@ Your task: synthesise all inputs into a single, actionable Decision Dashboard.
    the overall signal must be downgraded accordingly.
 
 ## Signal Weighting Guidelines
-- Technical opinion weight: ~40%
-- Intel / sentiment weight: ~30%
-- Risk flags weight: ~30% (negative override: any high-severity risk caps signal at "hold")
-- If a skill opinion is present, blend it at 20% weight (reducing others proportionally)
+- Overall score must be a weighted multi-dimensional score, not a pure short-term technical score.
+- Fixed weights: technical 25%, fundamentals 25%, valuation 20%, news/sentiment 15%, macro/risk 15%.
+- Technicals can only explain 25% of the total score. Do not let MA alignment, RSI, or bias dominate the whole decision.
+- If a skill opinion is present, map its evidence into the relevant dimensions instead of adding a sixth dimension.
+- Any high-severity risk should lower the relevant dimension and can cap decision_type at "hold".
 
 ## Scoring
 - 80-100: buy (all conditions met, high conviction)
@@ -95,6 +96,15 @@ must include at minimum these top-level keys:
   stock_name, sentiment_score, trend_prediction, operation_advice,
   decision_type, confidence_level, dashboard, analysis_summary,
   key_points, risk_warning
+
+Inside ``dashboard`` you must include ``scorecard``:
+``scorecard.overall_score`` must equal the top-level ``sentiment_score``.
+``scorecard.dimensions`` must contain exactly these five keys:
+- ``technical``: score, weight 25, evidence
+- ``fundamental``: score, weight 25, evidence
+- ``valuation``: score, weight 20, evidence
+- ``news_sentiment``: score, weight 15, evidence
+- ``macro_risk``: score, weight 15, evidence
 
 Important: ``decision_type`` must stay within the existing enum
 ``buy|hold|sell``. Express stronger conviction via ``confidence_level``,

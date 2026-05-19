@@ -72,6 +72,20 @@ describe('HistoryList', () => {
     expect(onToggleItemSelection).toHaveBeenCalledWith(1);
   });
 
+  it('shows admin all-user history title and username badge', () => {
+    render(
+      <HistoryList
+        {...baseProps}
+        items={[{ ...items[0], username: 'xiaoa', userId: 7 }]}
+        isAdminView
+      />,
+    );
+
+    expect(screen.getByText('全部用户查询记录')).toBeInTheDocument();
+    expect(screen.getByText('管理员')).toBeInTheDocument();
+    expect(screen.getByText('用户：xiaoa')).toBeInTheDocument();
+  });
+
   it('toggles select-all when clicking the label text', () => {
     const onToggleSelectAll = vi.fn();
 

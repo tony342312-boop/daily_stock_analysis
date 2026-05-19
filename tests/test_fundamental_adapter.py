@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from data_provider.fundamental_adapter import (
     AkshareFundamentalAdapter,
+    _build_a_share_financial_report_from_sina_frames,
     _build_dividend_payload,
     _extract_latest_row,
     _parse_dividend_plan_to_per_share,
@@ -101,19 +102,20 @@ class TestFundamentalAdapter(unittest.TestCase):
             }
         )
 
-        with patch.object(
-            adapter,
-            "_call_df_candidates",
-            side_effect=[
-                (fin_df, "stock_financial_abstract", []),
-                (forecast_df, "stock_yjyg_em", []),
-                (quick_df, "stock_yjkb_em", []),
-                (dividend_df, "stock_fhps_detail_em", []),
-                (None, None, []),
-                (None, None, []),
-            ],
-        ):
-            result = adapter.get_fundamental_bundle("600519")
+        with patch.object(adapter, "_build_sina_financial_report", return_value=({}, [])):
+            with patch.object(
+                adapter,
+                "_call_df_candidates",
+                side_effect=[
+                    (fin_df, "stock_financial_abstract", []),
+                    (forecast_df, "stock_yjyg_em", []),
+                    (quick_df, "stock_yjkb_em", []),
+                    (dividend_df, "stock_fhps_detail_em", []),
+                    (None, None, []),
+                    (None, None, []),
+                ],
+            ):
+                result = adapter.get_fundamental_bundle("600519")
 
         financial_report = result["earnings"].get("financial_report", {})
         self.assertEqual(financial_report.get("report_date"), within_ttm)
@@ -169,6 +171,60 @@ class TestFundamentalAdapter(unittest.TestCase):
         payload = _build_dividend_payload(df, stock_code="600519")
         self.assertEqual(payload.get("ttm_event_count"), 1)
         self.assertAlmostEqual(payload.get("ttm_cash_dividend_per_share"), 0.3, places=6)
+
+    def test_build_a_share_financial_report_from_sina_frames(self) -> None:
+        profit_df = pd.DataFrame(
+            {
+                "报告日": ["20260331", "20251231", "20250930", "20250630", "20250331", "20241231", "20240331"],
+                "公告日期": ["20260430", "20260328", "20251030", "20250830", "20250430", "20250328", "20240430"],
+                "营业总收入": [1000.0, 3600.0, 2700.0, 1800.0, 900.0, 3200.0, 800.0],
+                "归属于母公司所有者的净利润": [200.0, 720.0, 540.0, 360.0, 180.0, 640.0, 160.0],
+                "稀释每股收益": [1.0, 3.6, 2.7, 1.8, 0.9, 3.2, 0.8],
+            }
+        )
+        cash_df = pd.DataFrame(
+            {
+                "报告日": ["20260331", "20251231", "20250930", "20250630", "20250331", "20241231", "20240331"],
+                "经营活动产生的现金流量净额": [240.0, 800.0, 600.0, 400.0, 200.0, 700.0, 150.0],
+                "购建固定资产、无形资产和其他长期资产所支付的现金": [50.0, 160.0, 120.0, 80.0, 40.0, 120.0, 30.0],
+            }
+        )
+        balance_df = pd.DataFrame(
+            {
+                "报告日": ["20260331", "20251231"],
+                "资产总计": [10000.0, 9600.0],
+                "负债合计": [3000.0, 2800.0],
+                "归属于母公司股东权益合计": [7000.0, 6800.0],
+                "货币资金": [1200.0, 1000.0],
+                "短期借款": [100.0, 120.0],
+                "一年内到期的非流动负债": [50.0, 60.0],
+                "长期借款": [300.0, 320.0],
+            }
+        )
+
+        report = _build_a_share_financial_report_from_sina_frames(profit_df, balance_df, cash_df)
+
+        self.assertEqual(report.get("form"), "A股财报")
+        self.assertEqual(report.get("source"), "AkShare Sina 财务报表")
+        self.assertEqual(report.get("report_date"), "2026-03-31")
+        self.assertEqual(report.get("revenue_value"), 1000.0)
+        self.assertEqual(report.get("net_profit_parent_value"), 200.0)
+        self.assertEqual(report.get("free_cash_flow_value"), 190.0)
+        self.assertEqual(report.get("debt_to_assets_pct"), "30.00%")
+        self.assertEqual(report.get("equity_ratio_pct"), "70.00%")
+        self.assertEqual(report.get("roe"), "10.59%")
+
+        quarterly = report.get("quarterly_trend", [])
+        self.assertEqual(quarterly[0]["period"], "2026Q1")
+        self.assertAlmostEqual(quarterly[0]["revenue_value_yoy_pct"], 11.1111, places=4)
+        self.assertEqual(quarterly[1]["period"], "2025Q4")
+        self.assertTrue(quarterly[1]["derived"])
+        self.assertEqual(quarterly[1]["revenue_value"], 900.0)
+        self.assertEqual(quarterly[1]["free_cash_flow_value"], 160.0)
+
+        annual = report.get("annual_trend", [])
+        self.assertEqual(annual[0]["period"], "2025")
+        self.assertAlmostEqual(annual[0]["revenue_value_change_pct"], 12.5, places=4)
 
 
 if __name__ == "__main__":

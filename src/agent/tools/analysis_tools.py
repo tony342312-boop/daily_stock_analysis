@@ -18,7 +18,7 @@ def _fetch_trend_data(stock_code: str):
     """Fetch historical OHLCV (DataFrame) for trend analysis. DB first, then DataFetcher fallback."""
     from src.services.history_loader import load_history_df
 
-    df, _ = load_history_df(stock_code, days=60)
+    df, _ = load_history_df(stock_code, days=260)
     return df
 
 
@@ -52,6 +52,9 @@ def _handle_analyze_trend(stock_code: str) -> dict:
         "ma10": result.ma10,
         "ma20": result.ma20,
         "ma60": result.ma60,
+        "ma50": result.ma50,
+        "ma200": result.ma200,
+        "ema10": result.ema10,
         "current_price": result.current_price,
         "bias_ma5": round(result.bias_ma5, 2),
         "bias_ma10": round(result.bias_ma10, 2),
@@ -73,6 +76,12 @@ def _handle_analyze_trend(stock_code: str) -> dict:
         "rsi_24": round(result.rsi_24, 2),
         "rsi_status": result.rsi_status.value,
         "rsi_signal": result.rsi_signal,
+        "boll_mid": round(result.boll_mid, 4) if result.boll_mid is not None else None,
+        "boll_upper": round(result.boll_upper, 4) if result.boll_upper is not None else None,
+        "boll_lower": round(result.boll_lower, 4) if result.boll_lower is not None else None,
+        "atr14": round(result.atr14, 4) if result.atr14 is not None else None,
+        "vwma20": round(result.vwma20, 4) if result.vwma20 is not None else None,
+        "mfi14": round(result.mfi14, 2) if result.mfi14 is not None else None,
         "buy_signal": result.buy_signal.value,
         "signal_score": result.signal_score,
         "signal_reasons": result.signal_reasons,
@@ -85,7 +94,8 @@ analyze_trend_tool = ToolDefinition(
     description="Run comprehensive technical trend analysis on a stock. "
                 "Fetches historical data from database or data source. "
                 "Returns MA alignment, bias rates, MACD status, RSI levels, "
-                "volume analysis, support/resistance levels, and a buy/sell signal "
+                "Bollinger Bands, ATR, VWMA, MFI, volume analysis, "
+                "support/resistance levels, and a buy/sell signal "
                 "with a score (0-100).",
     parameters=[
         ToolParameter(

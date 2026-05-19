@@ -10,6 +10,7 @@ Resolve stock name to code: local mapping + pinyin + AkShare fallback + fuzzy ma
 from __future__ import annotations
 
 import difflib
+import json
 import logging
 import time
 from typing import Dict, Optional, Set, Tuple
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 # AkShare result cache: (timestamp, name_to_code_dict)
 _akshare_cache: Optional[tuple[float, Dict[str, str]]] = None
 _AKSHARE_CACHE_TTL = 1800  # 30 MIN
+_stock_index_name_cache: Optional[Dict[str, str]] = None
 
 
 def _contains_cjk(text: str) -> bool:
@@ -88,6 +90,61 @@ def _build_local_name_indexes(code_to_name: Dict[str, str]) -> Tuple[Dict[str, s
 _LOCAL_REVERSE_MAP, _LOCAL_AMBIGUOUS_NAMES = _build_local_name_indexes(STOCK_NAME_MAP)
 
 
+def _normalize_lookup_key(value: str) -> str:
+    """Normalize company names and aliases for exact frontend-index lookup."""
+    return "".join(str(value or "").strip().lower().split())
+
+
+def _get_stock_index_name_to_code() -> Dict[str, str]:
+    """Load frontend stock-index names/aliases as a backend resolver fallback."""
+    global _stock_index_name_cache
+    if _stock_index_name_cache is not None:
+        return _stock_index_name_cache
+
+    try:
+        from src.data.stock_index_loader import get_stock_index_candidate_paths
+
+        name_to_codes: Dict[str, Set[str]] = {}
+        for index_path in get_stock_index_candidate_paths():
+            if not index_path.is_file():
+                continue
+            with index_path.open("r", encoding="utf-8") as fh:
+                rows = json.load(fh)
+            if not isinstance(rows, list):
+                continue
+
+            for item in rows:
+                if not isinstance(item, list) or len(item) < 3:
+                    continue
+                canonical_code = str(item[0] or "").strip()
+                display_code = str(item[1] or "").strip()
+                stock_name = str(item[2] or "").strip()
+                aliases = item[5] if len(item) > 5 and isinstance(item[5], list) else []
+                resolved_code = (
+                    _normalize_code(canonical_code)
+                    or _normalize_code(display_code)
+                    or display_code
+                    or canonical_code
+                )
+                if not resolved_code:
+                    continue
+                for candidate in (stock_name, canonical_code, display_code, *aliases):
+                    key = _normalize_lookup_key(candidate)
+                    if key:
+                        name_to_codes.setdefault(key, set()).add(resolved_code)
+
+        _stock_index_name_cache = {
+            name: next(iter(codes))
+            for name, codes in name_to_codes.items()
+            if len(codes) == 1
+        }
+    except Exception as exc:
+        logger.debug("[NameResolver] Stock index alias lookup failed: %s", exc)
+        _stock_index_name_cache = {}
+
+    return _stock_index_name_cache
+
+
 def _get_akshare_name_to_code() -> Optional[Dict[str, str]]:
     """Fetch A-share name->code from AkShare, with cache."""
     global _akshare_cache
@@ -142,10 +199,11 @@ def resolve_name_to_code(name: str) -> Optional[str]:
     Strategy (in order):
     1. If input looks like a code (5-6 digits or 1-5 letters), return it normalized.
     2. Local STOCK_NAME_MAP reverse (exclude ambiguous names).
-    3. Pinyin match against local names.
-    4. AkShare online fallback (A-shares).
-    5. Fuzzy match (difflib).
-    6. Return None.
+    3. Frontend stock index aliases (US/HK/A-share curated autocomplete data).
+    4. Pinyin match against local names.
+    5. AkShare online fallback (A-shares).
+    6. Fuzzy match (difflib).
+    7. Return None.
 
     Args:
         name: Stock name or code string.
@@ -158,6 +216,11 @@ def resolve_name_to_code(name: str) -> Optional[str]:
     s = name.strip()
     if not s:
         return None
+
+    stock_index_code = _get_stock_index_name_to_code().get(_normalize_lookup_key(s))
+    if stock_index_code:
+        logger.debug("[NameResolver] Stock index alias hit: %s -> %s", s, stock_index_code)
+        return stock_index_code
 
     # 1. Input looks like code
     if _is_code_like(s):

@@ -79,6 +79,7 @@ def normalize_stock_code(stock_code: str) -> str:
     - 'HK00700'     -> 'HK00700'  (keep HK prefix for HK stocks)
     - '1810.HK'     -> 'HK01810'  (normalize HK suffix to canonical prefix form)
     - 'AAPL'        -> 'AAPL'     (keep US stock ticker as-is)
+    - 'AAPL.US'     -> 'AAPL'     (strip US market suffix)
 
     This function is applied at the DataProviderManager layer so that
     all individual fetchers receive a clean 6-digit code (for A-shares/ETFs).
@@ -112,6 +113,8 @@ def normalize_stock_code(stock_code: str) -> str:
             return f"HK{base.zfill(5)}"
         if suffix.upper() in ('SH', 'SZ', 'SS', 'BJ') and base.isdigit():
             return base
+        if suffix.upper() == 'US' and base.isalpha() and 1 <= len(base) <= 5:
+            return base.upper()
 
     return code
 
@@ -152,6 +155,28 @@ def _is_etf_code(code: str) -> bool:
         normalized.isdigit()
         and len(normalized) == 6
         and normalized.startswith(ETF_PREFIXES)
+    )
+
+
+def _looks_like_us_etf_name(name: str) -> bool:
+    """Infer US fund-like instruments from quote/display names."""
+    normalized = (name or "").strip().upper()
+    if not normalized:
+        return False
+    return any(
+        keyword in normalized
+        for keyword in (
+            " ETF",
+            "ETF ",
+            "ETF-",
+            "-ETF",
+            "EXCHANGE TRADED FUND",
+            " ETN",
+            "ETN ",
+            " FUND",
+            "FUND ",
+            "基金",
+        )
     )
 
 
@@ -509,6 +534,8 @@ class DataFetcherManager:
         self._tickflow_lock = RLock()
         self._fundamental_cache: Dict[str, Dict[str, Any]] = {}
         self._fundamental_cache_lock = RLock()
+        self._macro_context_cache: Dict[str, Any] = {}
+        self._macro_context_cache_lock = RLock()
         self._fundamental_timeout_worker_limit = 8
         self._fundamental_timeout_slots = BoundedSemaphore(self._fundamental_timeout_worker_limit)
 
@@ -524,6 +551,10 @@ class DataFetcherManager:
             self._stock_name_cache = {}
         if not hasattr(self, "_stock_name_cache_lock") or self._stock_name_cache_lock is None:
             self._stock_name_cache_lock = RLock()
+        if not hasattr(self, "_macro_context_cache") or self._macro_context_cache is None:
+            self._macro_context_cache = {}
+        if not hasattr(self, "_macro_context_cache_lock") or self._macro_context_cache_lock is None:
+            self._macro_context_cache_lock = RLock()
 
     def _get_fetchers_snapshot(self) -> List[BaseFetcher]:
         self._ensure_concurrency_guards()
@@ -1962,6 +1993,356 @@ class DataFetcherManager:
             **blocks,
         }
 
+    def _get_peer_valuation_context_for_market(
+        self,
+        stock_code: str,
+        market: str,
+        config: Any,
+        budget_seconds: Optional[float] = None,
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[str]]:
+        """Fetch same-type peer PE/PB comparison for a market."""
+        if not getattr(config, "peer_valuation_enabled", True):
+            return {}, [], []
+
+        from .peer_valuation import PeerValuationClient, parse_peer_map
+
+        map_attr = {
+            "us": "us_peer_valuation_map",
+            "cn": "cn_peer_valuation_map",
+            "hk": "hk_peer_valuation_map",
+        }.get(market, "us_peer_valuation_map")
+        peer_map = parse_peer_map(getattr(config, map_attr, ""))
+        peer_timeout = float(getattr(config, "peer_valuation_timeout_seconds", 15.0) or 15.0)
+        provider = f"{market}_peer_valuation"
+        if budget_seconds is not None:
+            peer_timeout = min(peer_timeout, max(0.0, float(budget_seconds)))
+        if peer_timeout <= 0:
+            return (
+                {},
+                [{"provider": provider, "result": "skipped", "duration_ms": 0}],
+                ["peer valuation skipped because fundamental stage budget is reserved for statements"],
+            )
+
+        try:
+            peer_client = PeerValuationClient(
+                quote_fetcher=lambda symbol: self.get_realtime_quote(symbol, log_final_failure=False),
+                peer_map=peer_map,
+                max_peers=getattr(config, "peer_valuation_max_peers", 5),
+                market=market,
+            )
+            peer_payload, peer_err_msg, peer_elapsed_ms = self._run_with_retry(
+                lambda: peer_client.get_peer_valuation_context(stock_code),
+                max(1.0, peer_timeout),
+                "peer_valuation_context",
+            )
+            if isinstance(peer_payload, dict):
+                peer_chain = self._normalize_source_chain(
+                    peer_payload.get("source_chain", []),
+                    provider,
+                    str(peer_payload.get("status", "ok")),
+                    peer_elapsed_ms,
+                )
+                peer_errors = list(peer_payload.get("errors", []))
+                if peer_err_msg:
+                    peer_errors.append(peer_err_msg)
+                return peer_payload, peer_chain, peer_errors
+            if peer_err_msg:
+                return {}, [{"provider": provider, "result": "failed", "duration_ms": peer_elapsed_ms}], [peer_err_msg]
+        except Exception as exc:
+            return {}, [{"provider": provider, "result": "failed", "duration_ms": 0}], [str(exc)]
+
+        return {}, [], []
+
+    @staticmethod
+    def _quote_to_basic_payload(quote: Any, fallback_code: str = "") -> Dict[str, Any]:
+        """Convert a quote object to a compact serializable payload."""
+        if quote is None:
+            return {}
+        if hasattr(quote, "to_dict"):
+            try:
+                payload = quote.to_dict()
+                if isinstance(payload, dict):
+                    return {key: value for key, value in payload.items() if value is not None}
+            except Exception:
+                pass
+        source = getattr(getattr(quote, "source", None), "value", getattr(quote, "source", None))
+        payload = {
+            "code": getattr(quote, "code", fallback_code),
+            "name": getattr(quote, "name", None),
+            "source": source,
+            "price": getattr(quote, "price", None),
+            "change_pct": getattr(quote, "change_pct", None),
+            "change_amount": getattr(quote, "change_amount", None),
+            "volume": getattr(quote, "volume", None),
+            "amount": getattr(quote, "amount", None),
+            "volume_ratio": getattr(quote, "volume_ratio", None),
+            "turnover_rate": getattr(quote, "turnover_rate", None),
+            "amplitude": getattr(quote, "amplitude", None),
+            "open_price": getattr(quote, "open_price", None),
+            "high": getattr(quote, "high", None),
+            "low": getattr(quote, "low", None),
+            "pre_close": getattr(quote, "pre_close", None),
+            "pe_ratio": getattr(quote, "pe_ratio", None),
+            "pb_ratio": getattr(quote, "pb_ratio", None),
+            "total_mv": getattr(quote, "total_mv", None),
+            "circ_mv": getattr(quote, "circ_mv", None),
+        }
+        return {key: value for key, value in payload.items() if value is not None}
+
+    def _get_hk_fundamental_context(self, stock_code: str) -> Dict[str, Any]:
+        """Build a partial HK context from quote valuation plus peer valuation."""
+        from src.config import get_config
+
+        config = get_config()
+        start_ts = time.time()
+        fetch_timeout = max(0.0, float(getattr(config, "fundamental_fetch_timeout_seconds", 6.0) or 6.0))
+        quote_payload, quote_err, quote_ms = self._run_with_retry(
+            lambda: self.get_realtime_quote(stock_code, log_final_failure=False),
+            max(1.0, fetch_timeout),
+            "hk_realtime_quote",
+        )
+        quote_dict = self._quote_to_basic_payload(quote_payload, stock_code)
+        valuation_payload = {
+            "quote": quote_dict,
+            "pe_ratio": getattr(quote_payload, "pe_ratio", None) if quote_payload else None,
+            "pb_ratio": getattr(quote_payload, "pb_ratio", None) if quote_payload else None,
+            "total_mv": getattr(quote_payload, "total_mv", None) if quote_payload else None,
+            "circ_mv": getattr(quote_payload, "circ_mv", None) if quote_payload else None,
+            "turnover_rate": getattr(quote_payload, "turnover_rate", None) if quote_payload else None,
+            "volume_ratio": getattr(quote_payload, "volume_ratio", None) if quote_payload else None,
+        }
+        valuation_status = self._infer_block_status(
+            {key: value for key, value in valuation_payload.items() if key != "quote"},
+            "partial" if quote_payload is not None else "not_supported",
+        )
+        quote_chain = self._normalize_source_chain(
+            [{"provider": quote_dict.get("source") or "realtime_quote", "result": valuation_status, "duration_ms": quote_ms}],
+            "realtime_quote",
+            valuation_status,
+            quote_ms,
+        )
+        blocks = {
+            "valuation": self._build_fundamental_block(
+                valuation_status,
+                valuation_payload,
+                quote_chain,
+                [quote_err] if quote_err else [],
+            ),
+            "growth": self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "hk_fundamental_bundle", "result": "not_supported", "duration_ms": 0}],
+                ["HK growth/statement bundle not implemented"],
+            ),
+            "earnings": self._build_fundamental_block(
+                "not_supported",
+                {"financial_report": {"source": "not_configured", "quarterly_trend": [], "annual_trend": []}},
+                [{"provider": "hk_fundamental_bundle", "result": "not_supported", "duration_ms": 0}],
+                ["HK filings/earnings bundle not implemented"],
+            ),
+            "institution": self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "hk_fundamental_bundle", "result": "not_supported", "duration_ms": 0}],
+                ["HK institution block not implemented"],
+            ),
+            "capital_flow": self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "hk_fundamental_bundle", "result": "not_supported", "duration_ms": 0}],
+                ["HK capital flow block not implemented"],
+            ),
+            "dragon_tiger": self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "hk_fundamental_bundle", "result": "not_supported", "duration_ms": 0}],
+                ["dragon tiger data is CN-only"],
+            ),
+            "boards": self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "hk_fundamental_bundle", "result": "not_supported", "duration_ms": 0}],
+                ["HK board/sector block not implemented"],
+            ),
+        }
+        source_chain = list(quote_chain)
+        errors = [quote_err] if quote_err else []
+        peer_payload, peer_chain, peer_errors = self._get_peer_valuation_context_for_market(
+            stock_code,
+            "hk",
+            config,
+        )
+        source_chain.extend(peer_chain)
+        errors.extend(peer_errors)
+        coverage = {block: blocks[block]["status"] for block in blocks}
+        coverage["peer_valuation"] = str(peer_payload.get("status", "not_configured")) if peer_payload else "not_configured"
+        statuses = list(coverage.values())
+        status = "not_supported" if all(value == "not_supported" for value in statuses) else "partial"
+        return {
+            "market": "hk",
+            "status": status,
+            "provider": quote_dict.get("source") or "realtime_quote",
+            "company_name": quote_dict.get("name") or stock_code,
+            "peer_valuation": peer_payload,
+            "coverage": coverage,
+            "source_chain": source_chain,
+            "errors": errors,
+            "elapsed_ms": int((time.time() - start_ts) * 1000),
+            **blocks,
+        }
+
+    def _build_us_etf_fundamental_context(
+        self,
+        ticker: str,
+        quote: Any,
+        reason: str,
+        start_ts: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Build a fund-aware context for US ETFs/ETNs instead of company statements."""
+        return self._build_etf_fundamental_context(
+            ticker=ticker,
+            market="us",
+            quote=quote,
+            reason=reason,
+            start_ts=start_ts,
+        )
+
+    def _build_etf_fundamental_context(
+        self,
+        ticker: str,
+        market: str,
+        quote: Any,
+        reason: str,
+        start_ts: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Build a fund-aware context for ETFs/funds instead of company statements."""
+        if start_ts is None:
+            start_ts = time.time()
+        try:
+            from .etf_context import EtfContextClient
+
+            etf_payload, etf_err, etf_ms = self._run_with_retry(
+                lambda: EtfContextClient().get_context(ticker, market, quote=quote),
+                4.0,
+                "etf_context",
+            )
+            if not isinstance(etf_payload, dict):
+                raise RuntimeError(etf_err or "ETF context unavailable")
+        except Exception as exc:
+            etf_ms = 0
+            etf_payload = {
+                "provider": "etf_context",
+                "status": "not_supported",
+                "asset_type": "etf",
+                "market": market,
+                "symbol": ticker,
+                "name": ticker,
+                "quote": {},
+                "fund_profile": {
+                    "asset_type": "etf",
+                    "symbol": ticker,
+                    "market": market,
+                    "name": ticker,
+                    "statement_model": "fund",
+                    "company_financial_report_applicable": False,
+                },
+                "holdings": {},
+                "exposure": {},
+                "operations": {},
+                "liquidity": {},
+                "source_chain": [{"provider": "etf_context", "result": "failed", "duration_ms": etf_ms}],
+                "errors": [str(exc)],
+            }
+
+        quote_payload = etf_payload.get("quote", {}) if isinstance(etf_payload, dict) else {}
+        fund_profile = etf_payload.get("fund_profile", {}) if isinstance(etf_payload, dict) else {}
+        fund_name = fund_profile.get("name") or quote_payload.get("name") or ticker
+        source_name = quote_payload.get("source") or "etf_context"
+        source_chain = [{"provider": source_name, "result": "partial", "duration_ms": 0}]
+        if isinstance(etf_payload, dict):
+            source_chain.extend(etf_payload.get("source_chain", []))
+        financial_report = {
+            "source": "not_applicable",
+            "asset_type": "etf",
+            "quarterly_trend": [],
+            "annual_trend": [],
+            "reason": "ETF/fund holdings, NAV, expense ratio, liquidity, and exposure are more relevant than company 10-Q/10-K statements.",
+        }
+        holdings_payload = etf_payload.get("holdings", {}) if isinstance(etf_payload, dict) else {}
+        exposure_payload = etf_payload.get("exposure", {}) if isinstance(etf_payload, dict) else {}
+        operations_payload = etf_payload.get("operations", {}) if isinstance(etf_payload, dict) else {}
+        liquidity_payload = etf_payload.get("liquidity", {}) if isinstance(etf_payload, dict) else {}
+        has_profile_data = self._has_meaningful_payload(quote_payload) or self._has_meaningful_payload(operations_payload)
+        has_exposure_data = self._has_meaningful_payload(holdings_payload) or self._has_meaningful_payload(exposure_payload)
+        has_liquidity_data = self._has_meaningful_payload(liquidity_payload)
+        blocks = {
+            "valuation": self._build_fundamental_block(
+                "partial" if has_profile_data else "not_supported",
+                {
+                    "fund_profile": fund_profile,
+                    "quote": quote_payload,
+                    "operations": operations_payload,
+                    "liquidity": liquidity_payload,
+                },
+                source_chain,
+                [] if has_profile_data else ["ETF quote/profile unavailable"],
+            ),
+            "growth": self._build_fundamental_block(
+                "not_supported",
+                {"fund_profile": fund_profile},
+                source_chain,
+                ["ETF performance should be evaluated from price history and tracking error, not company growth statements"],
+            ),
+            "earnings": self._build_fundamental_block(
+                "not_supported",
+                {"financial_report": financial_report, "fund_profile": fund_profile},
+                source_chain,
+                ["company financial statements are not applicable to ETFs"],
+            ),
+            "institution": self._build_fundamental_block(
+                "partial" if has_exposure_data else "not_supported",
+                {
+                    "fund_profile": fund_profile,
+                    "holdings": holdings_payload,
+                    "exposure": exposure_payload,
+                },
+                source_chain,
+                [] if has_exposure_data else ["ETF holdings/exposure data source unavailable"],
+            ),
+            "capital_flow": self._build_fundamental_block(
+                "partial" if has_liquidity_data else "not_supported",
+                {"liquidity": liquidity_payload},
+                source_chain,
+                [] if has_liquidity_data else ["ETF liquidity/flow data unavailable"],
+            ),
+            "dragon_tiger": self._build_fundamental_block(
+                "not_supported",
+                {},
+                source_chain,
+                ["dragon tiger data is CN-only"],
+            ),
+            "boards": self._build_fundamental_block(
+                "partial" if has_exposure_data else "not_supported",
+                {"exposure": exposure_payload},
+                source_chain,
+                [] if has_exposure_data else ["ETF sector/country exposure unavailable"],
+            ),
+        }
+        return {
+            "market": market,
+            "asset_type": "etf",
+            "status": "partial" if (has_profile_data or has_exposure_data or has_liquidity_data) else "not_supported",
+            "provider": source_name,
+            "company_name": fund_name,
+            "fund_profile": fund_profile,
+            "etf_profile": etf_payload,
+            "coverage": {block: blocks[block]["status"] for block in blocks},
+            "source_chain": source_chain,
+            "errors": [reason, *(etf_payload.get("errors", []) if isinstance(etf_payload, dict) else [])],
+            "elapsed_ms": int((time.time() - start_ts) * 1000),
+            **blocks,
+        }
+
     def get_fundamental_context(
         self,
         stock_code: str,
@@ -1982,11 +2363,15 @@ class DataFetcherManager:
         stock_code = normalize_stock_code(stock_code)
         market = _market_tag(stock_code)
         is_etf = _is_etf_code(stock_code)
-        if market in {"us", "hk"}:
+        if market == "us":
+            if getattr(config, "sec_edgar_enabled", False):
+                return self._get_us_fundamental_context(stock_code)
             return self._build_market_not_supported(
                 market=market,
-                reason="market not supported",
+                reason="SEC EDGAR disabled",
             )
+        if market == "hk":
+            return self._get_hk_fundamental_context(stock_code)
 
         stage_timeout = float(
             budget_seconds if budget_seconds is not None else config.fundamental_stage_timeout_seconds
@@ -2023,6 +2408,32 @@ class DataFetcherManager:
         }
 
         start_ts = time.time()
+        if is_etf:
+            if fetch_timeout > 0 and stage_timeout > 0:
+                etf_quote, etf_err, _etf_quote_ms = self._run_with_retry(
+                    lambda: self.get_realtime_quote(stock_code, log_final_failure=False),
+                    min(fetch_timeout, stage_timeout),
+                    "cn_etf_realtime_quote",
+                )
+            else:
+                etf_quote, etf_err = None, "fundamental stage timeout"
+            etf_ctx = self._build_etf_fundamental_context(
+                ticker=stock_code,
+                market=market,
+                quote=etf_quote,
+                reason="ETF/fund instrument: use fund profile, exposure, holdings, and liquidity instead of company financial statements",
+                start_ts=start_ts,
+            )
+            if etf_err:
+                etf_ctx.setdefault("errors", []).append(etf_err)
+            if cache_ttl > 0 and self._should_cache_fundamental_context(etf_ctx):
+                with self._fundamental_cache_lock:
+                    self._fundamental_cache[cache_key] = {
+                        "ts": time.time(),
+                        "context": etf_ctx,
+                    }
+                self._prune_fundamental_cache(cache_ttl, cache_max_entries)
+            return etf_ctx
 
         def _consume_budget(consumed_ms: int) -> None:
             nonlocal remaining_seconds
@@ -2121,7 +2532,7 @@ class DataFetcherManager:
             dividend_payload = dict(dividend_payload)
             ttm_cash_raw = dividend_payload.get("ttm_cash_dividend_per_share")
             ttm_cash = None
-            if ttm_cash_raw is not None:
+            if ttm_cash_raw is not None and str(ttm_cash_raw).strip().upper() not in {"", "N/A", "NA", "NONE"}:
                 try:
                     ttm_cash = float(ttm_cash_raw)
                 except (TypeError, ValueError):
@@ -2136,16 +2547,16 @@ class DataFetcherManager:
                     latest_price = float(latest_price_raw)
                 except (TypeError, ValueError):
                     latest_price = None
-            ttm_yield = None
             if ttm_cash is not None:
+                ttm_yield = None
                 if latest_price is not None and latest_price > 0:
                     ttm_yield = round(ttm_cash / latest_price * 100.0, 4)
                 else:
                     earnings_extra_errors.append("invalid_price_for_ttm_dividend_yield")
 
-            dividend_payload["ttm_dividend_yield_pct"] = ttm_yield
-            if ttm_yield is not None:
-                dividend_payload["yield_formula"] = "ttm_cash_dividend_per_share / latest_price * 100"
+                dividend_payload["ttm_dividend_yield_pct"] = ttm_yield
+                if ttm_yield is not None:
+                    dividend_payload["yield_formula"] = "ttm_cash_dividend_per_share / latest_price * 100"
             earnings_payload["dividend"] = dividend_payload
 
         adapter_errors = list(bundle_payload.get("errors", [])) if isinstance(bundle_payload, dict) else []
@@ -2158,6 +2569,10 @@ class DataFetcherManager:
         growth_status = self._infer_block_status(growth_payload, bundle_status)
         earnings_status = self._infer_block_status(earnings_payload, bundle_status)
         institution_status = self._infer_block_status(institution_payload, bundle_status)
+        has_statement_payload = bool(
+            isinstance(earnings_payload.get("financial_report"), dict)
+            and earnings_payload["financial_report"].get("quarterly_trend")
+        )
 
         result_ctx["growth"] = self._build_fundamental_block(
             growth_status,
@@ -2200,26 +2615,58 @@ class DataFetcherManager:
             )
             result_ctx["status"] = "partial"
         else:
-            capital_flow_budget = min(fetch_timeout, remaining_seconds)
-            capital_flow_start = time.time()
-            result_ctx["capital_flow"] = self.get_capital_flow_context(
-                stock_code,
-                budget_seconds=capital_flow_budget,
-            )
-            _consume_budget(int((time.time() - capital_flow_start) * 1000))
+            def _skipped_after_statement_block(provider: str) -> Dict[str, Any]:
+                return self._build_fundamental_block(
+                    "not_supported",
+                    {},
+                    [{"provider": provider, "result": "skipped", "duration_ms": 0}],
+                    ["skipped after structured financial statements to keep latency"],
+                )
 
-            dragon_tiger_budget = min(fetch_timeout, remaining_seconds)
-            dragon_tiger_start = time.time()
-            result_ctx["dragon_tiger"] = self.get_dragon_tiger_context(
-                stock_code,
-                budget_seconds=dragon_tiger_budget,
-            )
-            _consume_budget(int((time.time() - dragon_tiger_start) * 1000))
+            def _stage_timeout_block(provider: str) -> Dict[str, Any]:
+                return self._build_fundamental_block(
+                    "failed",
+                    {},
+                    [{"provider": provider, "result": "failed", "duration_ms": 0}],
+                    ["fundamental stage timeout"],
+                )
 
-            result_ctx["boards"] = self.get_board_context(
-                stock_code,
-                budget_seconds=min(fetch_timeout, remaining_seconds),
-            )
+            if has_statement_payload:
+                result_ctx["capital_flow"] = _skipped_after_statement_block("capital_flow")
+                result_ctx["dragon_tiger"] = _skipped_after_statement_block("dragon_tiger")
+                result_ctx["boards"] = _skipped_after_statement_block("boards")
+            elif remaining_seconds <= 0:
+                result_ctx["capital_flow"] = _stage_timeout_block("capital_flow")
+                result_ctx["dragon_tiger"] = _stage_timeout_block("dragon_tiger")
+                result_ctx["boards"] = _stage_timeout_block("boards")
+            else:
+                capital_flow_budget = min(fetch_timeout, remaining_seconds)
+                capital_flow_start = time.time()
+                result_ctx["capital_flow"] = self.get_capital_flow_context(
+                    stock_code,
+                    budget_seconds=capital_flow_budget,
+                )
+                _consume_budget(int((time.time() - capital_flow_start) * 1000))
+
+                if remaining_seconds <= 0:
+                    result_ctx["dragon_tiger"] = _stage_timeout_block("dragon_tiger")
+                    result_ctx["boards"] = _stage_timeout_block("boards")
+                else:
+                    dragon_tiger_budget = min(fetch_timeout, remaining_seconds)
+                    dragon_tiger_start = time.time()
+                    result_ctx["dragon_tiger"] = self.get_dragon_tiger_context(
+                        stock_code,
+                        budget_seconds=dragon_tiger_budget,
+                    )
+                    _consume_budget(int((time.time() - dragon_tiger_start) * 1000))
+
+                    if remaining_seconds <= 0:
+                        result_ctx["boards"] = _stage_timeout_block("boards")
+                    else:
+                        result_ctx["boards"] = self.get_board_context(
+                            stock_code,
+                            budget_seconds=min(fetch_timeout, remaining_seconds),
+                        )
 
         block_statuses = {
             "valuation": result_ctx["valuation"].get("status", "not_supported"),
@@ -2231,6 +2678,17 @@ class DataFetcherManager:
             "boards": result_ctx["boards"].get("status", "not_supported"),
         }
         result_ctx["coverage"] = block_statuses
+        peer_payload, peer_chain, peer_errors = self._get_peer_valuation_context_for_market(
+            stock_code,
+            "cn",
+            config,
+            budget_seconds=0.0 if has_statement_payload else remaining_seconds,
+        )
+        if peer_payload:
+            result_ctx["peer_valuation"] = peer_payload
+            result_ctx["coverage"]["peer_valuation"] = str(peer_payload.get("status", "not_configured"))
+            result_ctx["errors"].extend(peer_errors)
+            result_ctx["source_chain"].extend(peer_chain)
         for block in (
             "valuation",
             "growth",
@@ -2264,6 +2722,260 @@ class DataFetcherManager:
                 }
             self._prune_fundamental_cache(cache_ttl, cache_max_entries)
         return result_ctx
+
+    def _get_fred_macro_context(self, config: Any) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[str]]:
+        """Fetch and cache FRED macro context once per short window."""
+        if not getattr(config, "fred_enabled", True):
+            return {}, [{"provider": "fred", "result": "disabled", "duration_ms": 0}], []
+        if not getattr(config, "fred_api_key", None):
+            return (
+                {
+                    "provider": "FRED",
+                    "status": "not_configured",
+                    "indicators": {},
+                    "errors": ["FRED_API_KEY is not configured"],
+                },
+                [{"provider": "fred", "result": "not_configured", "duration_ms": 0}],
+                [],
+            )
+
+        cache_ttl = max(60, int(getattr(config, "fred_cache_ttl_seconds", 900) or 900))
+        cache_key = "fred_macro_context"
+        self._ensure_concurrency_guards()
+        with self._macro_context_cache_lock:
+            cached = self._macro_context_cache.get(cache_key)
+            if cached and (time.time() - float(cached.get("ts", 0))) <= cache_ttl:
+                return (
+                    cached.get("payload", {}),
+                    cached.get("source_chain", []),
+                    cached.get("errors", []),
+                )
+
+        try:
+            from .fred_macro import FredMacroClient
+
+            fred_timeout = max(1.0, float(getattr(config, "fred_timeout_seconds", 6.0) or 6.0))
+            fred_client = FredMacroClient(
+                api_key=getattr(config, "fred_api_key", ""),
+                timeout=fred_timeout,
+            )
+            fred_payload, fred_err_msg, fred_elapsed_ms = self._run_with_retry(
+                fred_client.get_macro_context,
+                fred_timeout,
+                "fred_macro_context",
+            )
+            if isinstance(fred_payload, dict):
+                macro_payload = fred_payload
+                macro_chain = self._normalize_source_chain(
+                    fred_payload.get("source_chain", []),
+                    "fred",
+                    str(fred_payload.get("status", "ok")),
+                    fred_elapsed_ms,
+                )
+                macro_errors = list(fred_payload.get("errors", []))
+                with self._macro_context_cache_lock:
+                    self._macro_context_cache[cache_key] = {
+                        "ts": time.time(),
+                        "payload": macro_payload,
+                        "source_chain": macro_chain,
+                        "errors": macro_errors,
+                    }
+                return macro_payload, macro_chain, macro_errors
+            if fred_err_msg:
+                return {}, [{"provider": "fred", "result": "failed", "duration_ms": fred_elapsed_ms}], [fred_err_msg]
+        except Exception as exc:
+            return {}, [{"provider": "fred", "result": "failed", "duration_ms": 0}], [str(exc)]
+
+        return {}, [], []
+
+    def _get_us_fundamental_context(self, stock_code: str) -> Dict[str, Any]:
+        """Build US-stock fundamental context from SEC EDGAR, quote, macro, and peers."""
+        from src.config import get_config
+        from .sec_edgar import SecEdgarClient
+
+        config = get_config()
+        start_ts = time.time()
+        ticker = normalize_stock_code(stock_code).upper()
+        timeout = float(getattr(config, "sec_edgar_timeout_seconds", 8.0) or 8.0)
+        client = SecEdgarClient(
+            user_agent=getattr(config, "sec_edgar_user_agent", None),
+            timeout=timeout,
+        )
+
+        try:
+            payload, err_msg, elapsed_ms = self._run_with_retry(
+                lambda: client.get_company_context(ticker),
+                max(1.0, timeout),
+                "sec_edgar_fundamental",
+            )
+        except Exception as exc:
+            payload, err_msg, elapsed_ms = None, str(exc), 0
+
+        if not isinstance(payload, dict):
+            reason = err_msg or "SEC EDGAR fundamental fetch failed"
+            quote, quote_err, _quote_ms = self._run_with_retry(
+                lambda: self.get_realtime_quote(ticker, log_final_failure=False),
+                max(1.0, float(getattr(config, "fundamental_fetch_timeout_seconds", 3.0) or 3.0)),
+                "us_realtime_quote",
+            )
+            quote_name = getattr(quote, "name", "") if quote is not None else ""
+            if _looks_like_us_etf_name(quote_name):
+                return self._build_us_etf_fundamental_context(
+                    ticker,
+                    quote,
+                    reason if not quote_err else f"{reason}; quote fallback: {quote_err}",
+                    start_ts,
+                )
+            failed = self._build_market_not_supported("us", reason)
+            failed["status"] = "failed"
+            failed["coverage"] = {key: "failed" for key in failed.get("coverage", {})}
+            for block in ("valuation", "growth", "earnings", "institution", "capital_flow", "dragon_tiger", "boards"):
+                failed[block] = self._build_fundamental_block(
+                    "failed",
+                    {},
+                    [{"provider": "sec_edgar", "result": "failed", "duration_ms": elapsed_ms}],
+                    [reason],
+                )
+            failed["source_chain"] = [{"provider": "sec_edgar", "result": "failed", "duration_ms": elapsed_ms}]
+            failed["errors"] = [reason]
+            failed["elapsed_ms"] = int((time.time() - start_ts) * 1000)
+            return failed
+
+        quote_timeout = float(getattr(config, "fundamental_fetch_timeout_seconds", 6.0) or 6.0)
+        quote_payload, quote_err_msg, quote_elapsed_ms = self._run_with_retry(
+            lambda: self.get_realtime_quote(ticker, log_final_failure=False),
+            max(1.0, quote_timeout),
+            "us_realtime_quote",
+        )
+        quote_dict = self._quote_to_basic_payload(quote_payload, ticker)
+        valuation_metrics = {
+            "pe_ratio": getattr(quote_payload, "pe_ratio", None) if quote_payload else None,
+            "pb_ratio": getattr(quote_payload, "pb_ratio", None) if quote_payload else None,
+            "total_mv": getattr(quote_payload, "total_mv", None) if quote_payload else None,
+            "circ_mv": getattr(quote_payload, "circ_mv", None) if quote_payload else None,
+        }
+        valuation_status = self._infer_block_status(
+            valuation_metrics,
+            "partial" if quote_payload is not None else "not_supported",
+        )
+        quote_chain = self._normalize_source_chain(
+            [{"provider": quote_dict.get("source") or "realtime_quote", "result": valuation_status, "duration_ms": quote_elapsed_ms}],
+            "realtime_quote",
+            valuation_status,
+            quote_elapsed_ms,
+        )
+        financial_report = payload.get("financial_report", {}) if isinstance(payload, dict) else {}
+        has_financial_report = self._has_meaningful_payload(financial_report)
+
+        earnings_payload = {
+            "financial_report": financial_report,
+            "dividend": payload.get("dividend", {}),
+            "filings": {
+                "latest_filing": payload.get("latest_filing"),
+                "latest_quarterly_filings": payload.get("latest_quarterly_filings", []),
+                "latest_annual_filing": payload.get("latest_annual_filing"),
+                "filing_references": payload.get("filing_references", []),
+            },
+        }
+        insider_filings = payload.get("recent_insider_filings", [])
+        if not isinstance(insider_filings, list):
+            insider_filings = []
+        insider_activity_payload = {
+            "source": "SEC EDGAR submissions",
+            "forms": ["3", "4", "5", "144"],
+            "recent_filings": insider_filings,
+        }
+        sec_chain = self._normalize_source_chain(
+            payload.get("source_chain", []),
+            "sec_edgar",
+            "ok",
+            elapsed_ms,
+        )
+        macro_payload, macro_chain, macro_errors = self._get_fred_macro_context(config)
+        peer_valuation_payload, peer_valuation_chain, peer_valuation_errors = (
+            self._get_peer_valuation_context_for_market(ticker, "us", config)
+        )
+        blocks = {
+            "valuation": self._build_fundamental_block(
+                valuation_status,
+                {
+                    **valuation_metrics,
+                    "quote": quote_dict,
+                },
+                quote_chain,
+                [quote_err_msg] if quote_err_msg else [],
+            ),
+            "growth": self._build_fundamental_block(
+                "partial" if has_financial_report else "not_supported",
+                {
+                    "financial_report": financial_report,
+                    "source": "SEC EDGAR companyfacts",
+                },
+                sec_chain,
+                [] if has_financial_report else ["SEC companyfacts financial trend unavailable"],
+            ),
+            "earnings": self._build_fundamental_block(
+                "ok" if has_financial_report else "partial",
+                earnings_payload,
+                sec_chain,
+                [] if has_financial_report else ["SEC financial statement trend unavailable"],
+            ),
+            "institution": self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "sec_edgar", "result": "not_supported", "duration_ms": 0}],
+                ["US institution block not implemented"],
+            ),
+            "insider_activity": self._build_fundamental_block(
+                "ok" if insider_filings else "partial",
+                insider_activity_payload,
+                sec_chain,
+                [] if insider_filings else ["No recent SEC Forms 3/4/5/144 found in submissions feed"],
+            ),
+            "capital_flow": self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "sec_edgar", "result": "not_supported", "duration_ms": 0}],
+                ["US capital flow block not implemented"],
+            ),
+            "dragon_tiger": self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "sec_edgar", "result": "not_supported", "duration_ms": 0}],
+                ["dragon tiger data is CN-only"],
+            ),
+            "boards": self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "sec_edgar", "result": "not_supported", "duration_ms": 0}],
+                ["US board membership block not implemented"],
+            ),
+        }
+        coverage = {block: blocks[block]["status"] for block in blocks}
+        coverage["quote"] = valuation_status
+        coverage["macro"] = str(macro_payload.get("status", "not_configured")) if macro_payload else "not_configured"
+        coverage["peer_valuation"] = (
+            str(peer_valuation_payload.get("status", "not_configured"))
+            if peer_valuation_payload
+            else "not_configured"
+        )
+        combined_chain = [*sec_chain, *quote_chain, *macro_chain, *peer_valuation_chain]
+        return {
+            "market": "us",
+            "status": "partial",
+            "provider": "SEC EDGAR",
+            "cik": payload.get("cik"),
+            "company_name": payload.get("company_name"),
+            "sec_edgar": payload,
+            "quote": quote_dict,
+            "macro": macro_payload,
+            "peer_valuation": peer_valuation_payload,
+            "coverage": coverage,
+            "source_chain": combined_chain,
+            "errors": [*([quote_err_msg] if quote_err_msg else []), *macro_errors, *peer_valuation_errors],
+            "elapsed_ms": int((time.time() - start_ts) * 1000),
+            **blocks,
+        }
 
     def get_capital_flow_context(self, stock_code: str, budget_seconds: Optional[float] = None) -> Dict[str, Any]:
         """资金流向块（fail-open）。"""

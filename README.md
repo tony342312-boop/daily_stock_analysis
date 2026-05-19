@@ -120,10 +120,19 @@
 | `ANSPIRE_API_KEYS` | [Anspire AI Search](https://aisearch.anspire.cn/)：中文内容特别优化，可增强 A 股分析效果 | 推荐 |
 | `SERPAPI_API_KEYS` | [SerpAPI](https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis)：搜索引擎结果补强，适合实时金融新闻 | 推荐 |
 | `TAVILY_API_KEYS` | [Tavily](https://tavily.com/)：通用新闻搜索 API | 可选 |
+| `EXA_API_KEYS` | [Exa](https://exa.ai/docs/reference/search-api-guide-for-coding-agents)：语义搜索 + highlights，适合 AI agent 研究上下文 | 可选 |
 | `BOCHA_API_KEYS` | [博查搜索](https://open.bocha.cn/)：中文搜索优化，支持 AI 摘要 | 可选 |
 | `BRAVE_API_KEYS` | [Brave Search](https://brave.com/search/api/)：隐私优先，美股资讯补强 | 可选 |
 | `MINIMAX_API_KEYS` | [MiniMax](https://platform.minimaxi.com/)：结构化搜索结果 | 可选 |
 | `SEARXNG_BASE_URLS` | SearXNG 自建实例：无配额兜底，适合私有部署 | 可选 |
+| `MULTI_SEARCH_ENGINE_ENABLED` | 免费无 Key 多搜索兜底：可聚合 DuckDuckGo、Google News RSS、Bing News RSS | 可选 |
+| `SEC_EDGAR_ENABLED` | SEC EDGAR：美股 10-Q/10-K 原文链接与 companyfacts 财报字段，无需 API Key | 可选 |
+| `SEC_EDGAR_USER_AGENT` | SEC fair-access User-Agent，建议填写应用名和联系邮箱 | 推荐 |
+| `FRED_API_KEY` | [FRED](https://fred.stlouisfed.org/docs/api/fred/)：美股宏观上下文（美债收益率、收益率曲线、CPI、失业率、联邦基金利率） | 可选 |
+| `PEER_VALUATION_ENABLED` | 同类型估值对比：基于实时行情字段展示 PE/PB/市值与 peer 中位数 | 可选 |
+| `US_PEER_VALUATION_MAP` | 自定义美股同类型 peer 组 JSON，例如 `{"AAPL":["DELL","HPQ","SONY"]}` | 可选 |
+| `CN_PEER_VALUATION_MAP` | 自定义 A 股同类型 peer 组 JSON，例如 `{"600519":["000858","000568"]}` | 可选 |
+| `HK_PEER_VALUATION_MAP` | 自定义港股同类型 peer 组 JSON，例如 `{"HK00700":["HK09999","HK03690"]}` | 可选 |
 
 更多搜索源、社交舆情和降级规则见 [搜索服务配置](docs/full-guide.md#搜索服务配置)。
 

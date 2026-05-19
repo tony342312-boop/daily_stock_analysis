@@ -15,6 +15,7 @@ FastAPI 应用工厂模块
     app = create_app()
 """
 
+import asyncio
 import logging
 import mimetypes
 import os
@@ -115,13 +116,45 @@ from api.v1.schemas.common import HealthResponse
 from src.services.system_config_service import SystemConfigService
 
 
+async def _history_cleanup_loop() -> None:
+    """Periodically clean analysis history older than retention days."""
+    from src.storage import DatabaseManager
+
+    enabled = os.getenv("HISTORY_AUTO_CLEANUP_ENABLED", "true").lower() in {"true", "1", "yes"}
+    if not enabled:
+        return
+    try:
+        days = int(os.getenv("HISTORY_RETENTION_DAYS", "14"))
+    except ValueError:
+        days = 14
+    while True:
+        try:
+            deleted = DatabaseManager.get_instance().delete_analysis_history_older_than(days=days)
+            if deleted:
+                logger.info("History cleanup deleted %s record(s) older than %s days", deleted, days)
+        except Exception as exc:
+            logger.warning("History cleanup failed: %s", exc, exc_info=True)
+        await asyncio.sleep(24 * 3600)
+
+
 @asynccontextmanager
 async def app_lifespan(app: FastAPI):
     """Initialize and release shared services for the app lifecycle."""
     app.state.system_config_service = SystemConfigService()
+    from src.auth import ensure_admin_user
+    from src.storage import DatabaseManager
+    ensure_admin_user()
+    try:
+        if os.getenv("HISTORY_AUTO_CLEANUP_ENABLED", "true").lower() in {"true", "1", "yes"}:
+            days = int(os.getenv("HISTORY_RETENTION_DAYS", "14"))
+            DatabaseManager.get_instance().delete_analysis_history_older_than(days=days)
+    except Exception as exc:
+        logger.warning("Startup history cleanup failed: %s", exc, exc_info=True)
+    cleanup_task = asyncio.create_task(_history_cleanup_loop())
     try:
         yield
     finally:
+        cleanup_task.cancel()
         if hasattr(app.state, "system_config_service"):
             delattr(app.state, "system_config_service")
 

@@ -18,7 +18,7 @@
 
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from enum import Enum
 
 import pandas as pd
@@ -94,6 +94,9 @@ class TrendAnalysisResult:
     ma10: float = 0.0
     ma20: float = 0.0
     ma60: float = 0.0
+    ma50: Optional[float] = None
+    ma200: Optional[float] = None
+    ema10: Optional[float] = None
     current_price: float = 0.0
     
     # 乖离率（与 MA5 的偏离度）
@@ -126,6 +129,14 @@ class TrendAnalysisResult:
     rsi_status: RSIStatus = RSIStatus.NEUTRAL
     rsi_signal: str = ""              # RSI 信号描述
 
+    # TradingAgents-style extended indicators
+    boll_mid: Optional[float] = None
+    boll_upper: Optional[float] = None
+    boll_lower: Optional[float] = None
+    atr14: Optional[float] = None
+    vwma20: Optional[float] = None
+    mfi14: Optional[float] = None
+
     # 买入信号
     buy_signal: BuySignal = BuySignal.WAIT
     signal_score: int = 0            # 综合评分 0-100
@@ -142,6 +153,9 @@ class TrendAnalysisResult:
             'ma10': self.ma10,
             'ma20': self.ma20,
             'ma60': self.ma60,
+            'ma50': self.ma50,
+            'ma200': self.ma200,
+            'ema10': self.ema10,
             'current_price': self.current_price,
             'bias_ma5': self.bias_ma5,
             'bias_ma10': self.bias_ma10,
@@ -165,6 +179,12 @@ class TrendAnalysisResult:
             'rsi_24': self.rsi_24,
             'rsi_status': self.rsi_status.value,
             'rsi_signal': self.rsi_signal,
+            'boll_mid': self.boll_mid,
+            'boll_upper': self.boll_upper,
+            'boll_lower': self.boll_lower,
+            'atr14': self.atr14,
+            'vwma20': self.vwma20,
+            'mfi14': self.mfi14,
         }
 
 
@@ -229,6 +249,7 @@ class StockTrendAnalyzer:
         # 计算 MACD 和 RSI
         df = self._calculate_macd(df)
         df = self._calculate_rsi(df)
+        df = self._calculate_extended_indicators(df)
 
         # 获取最新数据
         latest = df.iloc[-1]
@@ -237,6 +258,15 @@ class StockTrendAnalyzer:
         result.ma10 = float(latest['MA10'])
         result.ma20 = float(latest['MA20'])
         result.ma60 = float(latest.get('MA60', 0))
+        result.ma50 = self._latest_optional_float(latest, 'MA50')
+        result.ma200 = self._latest_optional_float(latest, 'MA200')
+        result.ema10 = self._latest_optional_float(latest, 'EMA10')
+        result.boll_mid = self._latest_optional_float(latest, 'BOLL_MID')
+        result.boll_upper = self._latest_optional_float(latest, 'BOLL_UPPER')
+        result.boll_lower = self._latest_optional_float(latest, 'BOLL_LOWER')
+        result.atr14 = self._latest_optional_float(latest, 'ATR14')
+        result.vwma20 = self._latest_optional_float(latest, 'VWMA20')
+        result.mfi14 = self._latest_optional_float(latest, 'MFI14')
 
         # 1. 趋势判断
         self._analyze_trend(df, result)
@@ -267,10 +297,70 @@ class StockTrendAnalyzer:
         df['MA5'] = df['close'].rolling(window=5).mean()
         df['MA10'] = df['close'].rolling(window=10).mean()
         df['MA20'] = df['close'].rolling(window=20).mean()
+        df['MA50'] = df['close'].rolling(window=50).mean()
+        df['MA200'] = df['close'].rolling(window=200).mean()
+        df['EMA10'] = df['close'].ewm(span=10, adjust=False).mean()
         if len(df) >= 60:
             df['MA60'] = df['close'].rolling(window=60).mean()
         else:
             df['MA60'] = df['MA20']  # 数据不足时使用 MA20 替代
+        return df
+
+    @staticmethod
+    def _latest_optional_float(row: pd.Series, key: str) -> Optional[float]:
+        value = row.get(key)
+        try:
+            if value is None or pd.isna(value):
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _calculate_extended_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """计算 TradingAgents 也会使用的一组扩展技术指标。"""
+        df = df.copy()
+
+        close = pd.to_numeric(df['close'], errors='coerce')
+        high = pd.to_numeric(df['high'] if 'high' in df.columns else close, errors='coerce').fillna(close)
+        low = pd.to_numeric(df['low'] if 'low' in df.columns else close, errors='coerce').fillna(close)
+        if 'volume' in df.columns:
+            volume = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
+        else:
+            volume = pd.Series(0.0, index=df.index)
+
+        boll_mid = close.rolling(window=20).mean()
+        boll_std = close.rolling(window=20).std(ddof=0)
+        df['BOLL_MID'] = boll_mid
+        df['BOLL_UPPER'] = boll_mid + 2 * boll_std
+        df['BOLL_LOWER'] = boll_mid - 2 * boll_std
+
+        prev_close = close.shift(1)
+        true_range = pd.concat(
+            [
+                high - low,
+                (high - prev_close).abs(),
+                (low - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        df['ATR14'] = true_range.rolling(window=14).mean()
+
+        volume_sum_20 = volume.rolling(window=20).sum()
+        df['VWMA20'] = (close * volume).rolling(window=20).sum() / volume_sum_20.replace(0, np.nan)
+
+        typical_price = (high + low + close) / 3
+        raw_money_flow = typical_price * volume
+        price_delta = typical_price.diff()
+        positive_flow = raw_money_flow.where(price_delta > 0, 0.0)
+        negative_flow = raw_money_flow.where(price_delta < 0, 0.0).abs()
+        positive_sum = positive_flow.rolling(window=14).sum()
+        negative_sum = negative_flow.rolling(window=14).sum()
+        money_flow_ratio = positive_sum / negative_sum.replace(0, np.nan)
+        mfi = 100 - (100 / (1 + money_flow_ratio))
+        mfi = mfi.mask((negative_sum == 0) & (positive_sum > 0), 100.0)
+        mfi = mfi.mask((positive_sum == 0) & (negative_sum > 0), 0.0)
+        df['MFI14'] = mfi.replace([np.inf, -np.inf], np.nan).clip(0, 100)
+
         return df
 
     def _calculate_macd(self, df: pd.DataFrame) -> pd.DataFrame:

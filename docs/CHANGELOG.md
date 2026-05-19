@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
+- [新功能] Web 首页新增“反馈问题”入口，普通用户可提交 Bug/建议/数据问题，后端自动推送到飞书反馈机器人；新增 `FEISHU_FEEDBACK_WEBHOOK_*` 专用配置并可回退复用 `FEISHU_WEBHOOK_*`。
+- [新功能] 测试站新增多账号认证基础能力：普通用户可通过用户名、密码和算术验证码注册/登录，管理员角色可查看全部历史记录，普通用户历史记录按 `user_id` 后端隔离。
+- [新功能] 新增历史记录保留期清理设置，默认 `HISTORY_AUTO_CLEANUP_ENABLED=true` 且 `HISTORY_RETENTION_DAYS=14`，服务启动和每日循环会清理超期查询记录。
+- [文档] `deploy/env.server.example` 补充 `DSA_ADMIN_USERNAME`、`DSA_ADMIN_PASSWORD`、`HISTORY_AUTO_CLEANUP_ENABLED`、`HISTORY_RETENTION_DAYS` 示例。
+- [修复] SEC EDGAR 季度趋势从 YTD 推导单季指标时复用相同起止日期的 SEC frame 行，避免 NVDA 等非自然年公司生成重复/误标 `CY2025Q4` 季度点。
 - [新功能] 大盘复盘支持港股市场：`MARKET_REVIEW_REGION` 新增 `hk` 选项；`both` 扩展为 A股+港股+美股，并新增港股指数（HSI/HSTECH/HSCEI）复盘链路。
 - [修复] Bot `/market` 命令复用 `get_open_markets_today()` / `compute_effective_region()` 做交易日过滤：结果作为 `override_region` 透传给 `run_market_review`；若结果为空字符串则跳过复盘并推送“今日相关市场休市”，与 CLI/调度入口行为一致。
 - [测试] 新增 `tests/test_bot_market_command.py`，覆盖 `MARKET_REVIEW_REGION=both` + open markets `{"cn","us"}` / `{"cn","hk"}` 的 `override_region` 透传断言，并覆盖全市场休市跳过与关闭交易日检查路径；新增 `tests/test_yfinance_hk_indices.py` 覆盖港股指数符号映射与部分/全部失败降级路径。

@@ -365,12 +365,25 @@ class AkshareFetcher(BaseFetcher):
         2. 失败后尝试新浪财经接口 (ak.stock_zh_a_daily)
         3. 最后尝试腾讯财经接口 (ak.stock_zh_a_hist_tx)
         """
-        # 尝试列表
+        # 尝试列表。新浪历史行情在部分网络环境下会长期阻塞，
+        # 因此默认跳过；需要时可设置 AKSHARE_ENABLE_SINA_HIST_FALLBACK=true。
         methods = [
             (self._fetch_stock_data_em, "东方财富"),
-            (self._fetch_stock_data_sina, "新浪财经"),
             (self._fetch_stock_data_tx, "腾讯财经"),
         ]
+        sina_hist_enabled = os.getenv("AKSHARE_ENABLE_SINA_HIST_FALLBACK", "false").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if sina_hist_enabled:
+            methods.insert(1, (self._fetch_stock_data_sina, "新浪财经"))
+        else:
+            logger.info(
+                "[数据源] 已跳过新浪财经历史行情 fallback；"
+                "如需启用请设置 AKSHARE_ENABLE_SINA_HIST_FALLBACK=true"
+            )
 
         last_error = None
 
@@ -499,12 +512,23 @@ class AkshareFetcher(BaseFetcher):
             )
 
             # 标准化腾讯数据列名
-            # 腾讯返回：date, open, close, high, low, volume, amount
+            # 腾讯返回列随 akshare 版本变化；当前版本常见为：
+            # date, open, close, high, low, amount，其中 amount 实际是成交量(手)。
             if df is not None and not df.empty:
+                if 'volume' not in df.columns and 'amount' in df.columns:
+                    volume_lot = pd.to_numeric(df['amount'], errors='coerce')
+                    df['volume'] = volume_lot * 100
+                    if 'close' in df.columns:
+                        close = pd.to_numeric(df['close'], errors='coerce')
+                        df['turnover_amount'] = df['volume'] * close
+                    else:
+                        df['turnover_amount'] = 0
+                    df = df.drop(columns=['amount'])
+
                 rename_map = {
                     'date': '日期', 'open': '开盘', 'high': '最高',
                     'low': '最低', 'close': '收盘', 'volume': '成交量',
-                    'amount': '成交额'
+                    'turnover_amount': '成交额'
                 }
                 df = df.rename(columns=rename_map)
 

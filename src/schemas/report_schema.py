@@ -30,6 +30,24 @@ class CoreConclusion(BaseModel):
     position_advice: Optional[PositionAdvice] = None
 
 
+class ScoreDimension(BaseModel):
+    """One weighted score dimension."""
+
+    label: Optional[str] = None
+    score: Optional[Union[int, float, str]] = None
+    weight: Optional[Union[int, float, str]] = None
+    evidence: Optional[str] = None
+
+
+class Scorecard(BaseModel):
+    """Weighted multi-dimensional scorecard."""
+
+    overall_score: Optional[Union[int, float, str]] = None
+    score_method: Optional[str] = None
+    total_weight: Optional[Union[int, float, str]] = None
+    dimensions: Optional[Dict[str, ScoreDimension]] = None
+
+
 class TrendStatus(BaseModel):
     """Trend status."""
 
@@ -117,6 +135,7 @@ class Dashboard(BaseModel):
     """Dashboard block."""
 
     core_conclusion: Optional[CoreConclusion] = None
+    scorecard: Optional[Scorecard] = None
     data_perspective: Optional[DataPerspective] = None
     intelligence: Optional[Intelligence] = None
     battle_plan: Optional[BattlePlan] = None

@@ -10,9 +10,14 @@ Responsibilities:
 3. Generate detailed reports in Markdown format
 """
 from __future__ import annotations
+import html
 import json
 import logging
+import os
+import subprocess
+import tempfile
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple, TYPE_CHECKING
 
 from src.config import get_config, resolve_news_window_days
@@ -67,7 +72,9 @@ class HistoryService:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         page: int = 1,
-        limit: int = 20
+        limit: int = 20,
+        user_id: Optional[int] = None,
+        include_all_users: bool = False,
     ) -> Dict[str, Any]:
         """
         Get history analysis list.
@@ -108,7 +115,9 @@ class HistoryService:
                 start_date=start_dt,
                 end_date=end_dt,
                 offset=offset,
-                limit=limit
+                limit=limit,
+                user_id=user_id,
+                include_all_users=include_all_users,
             )
             
             # Convert to response format
@@ -123,6 +132,8 @@ class HistoryService:
                     "sentiment_score": record.sentiment_score,
                     "operation_advice": record.operation_advice,
                     "created_at": record.created_at.isoformat() if record.created_at else None,
+                    "user_id": getattr(record, "user_id", None),
+                    "username": getattr(record, "username", None),
                 })
             
             return {
@@ -270,6 +281,8 @@ class HistoryService:
         return {
             "id": record.id,
             "query_id": record.query_id,
+            "user_id": getattr(record, "user_id", None),
+            "username": getattr(record, "username", None),
             "stock_code": record.code,
             "stock_name": record.name,
             "report_type": record.report_type,
@@ -470,6 +483,8 @@ class HistoryService:
                 record_id=record_id
             )
 
+        self._enrich_raw_result_from_context_snapshot(raw_result, record)
+
         try:
             result = self._rebuild_analysis_result(raw_result, record)
         except Exception as e:
@@ -495,6 +510,146 @@ class HistoryService:
                 f"Failed to generate markdown report: {str(e)}",
                 record_id=record_id
             ) from e
+
+    def get_pdf_report(self, record_id: str) -> Optional[bytes]:
+        """Generate a PDF report for a single analysis history record."""
+        markdown_content = self.get_markdown_report(record_id)
+        if markdown_content is None:
+            return None
+        return self._render_markdown_pdf(markdown_content, record_id=record_id)
+
+    @staticmethod
+    def _markdown_to_html(markdown_content: str) -> str:
+        try:
+            import markdown2
+
+            return markdown2.markdown(
+                markdown_content,
+                extras=[
+                    "fenced-code-blocks",
+                    "tables",
+                    "strike",
+                    "task_list",
+                    "cuddled-lists",
+                ],
+            )
+        except Exception as exc:
+            logger.debug("markdown2 conversion unavailable, using escaped plaintext fallback: %s", exc)
+            escaped = html.escape(markdown_content)
+            return f"<pre>{escaped}</pre>"
+
+    @classmethod
+    def _render_markdown_pdf(cls, markdown_content: str, *, record_id: str) -> bytes:
+        project_root = Path(__file__).resolve().parents[2]
+        chrome_wrapper = project_root / "scripts" / "chromium-markdown-pdf.sh"
+        if not chrome_wrapper.exists():
+            raise MarkdownReportGenerationError(
+                "PDF renderer is not installed: scripts/chromium-markdown-pdf.sh not found",
+                record_id=record_id,
+            )
+
+        body_html = cls._markdown_to_html(markdown_content)
+        html_doc = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <style>
+    @page {{ size: A4; margin: 18mm 16mm; }}
+    body {{
+      margin: 0;
+      color: #111827;
+      background: #ffffff;
+      font-family: "Noto Sans CJK SC", "WenQuanYi Micro Hei", "Microsoft YaHei", Arial, sans-serif;
+      font-size: 12px;
+      line-height: 1.72;
+    }}
+    h1 {{ font-size: 24px; margin: 0 0 18px; }}
+    h2 {{ font-size: 18px; margin: 24px 0 10px; border-bottom: 1px solid #e5e7eb; padding-bottom: 6px; }}
+    h3 {{ font-size: 15px; margin: 18px 0 8px; }}
+    p {{ margin: 7px 0; }}
+    a {{ color: #2563eb; text-decoration: none; }}
+    table {{ width: 100%; border-collapse: collapse; margin: 10px 0 16px; font-size: 10.5px; page-break-inside: auto; }}
+    th, td {{ border: 1px solid #d1d5db; padding: 5px 7px; vertical-align: top; word-break: break-word; }}
+    th {{ background: #f3f4f6; font-weight: 700; }}
+    tr {{ page-break-inside: avoid; page-break-after: auto; }}
+    blockquote {{ margin: 10px 0; padding: 8px 12px; border-left: 4px solid #93c5fd; background: #f8fafc; color: #374151; }}
+    code {{ font-family: "DejaVu Sans Mono", Consolas, monospace; background: #f3f4f6; padding: 1px 4px; border-radius: 3px; }}
+    pre {{ white-space: pre-wrap; word-break: break-word; background: #f3f4f6; padding: 10px; border-radius: 6px; }}
+    hr {{ border: 0; border-top: 1px solid #e5e7eb; margin: 18px 0; }}
+  </style>
+</head>
+<body>
+{body_html}
+</body>
+</html>"""
+
+        with tempfile.TemporaryDirectory(prefix="dsa-report-pdf-") as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            html_path = tmp_path / "report.html"
+            pdf_path = tmp_path / "report.pdf"
+            html_path.write_text(html_doc, encoding="utf-8")
+
+            env = os.environ.copy()
+            subprocess.run(
+                [
+                    str(chrome_wrapper),
+                    "--headless",
+                    "--disable-gpu",
+                    "--run-all-compositor-stages-before-draw",
+                    "--virtual-time-budget=1000",
+                    f"--print-to-pdf={pdf_path}",
+                    "--print-to-pdf-no-header",
+                    html_path.as_uri(),
+                ],
+                cwd=str(project_root),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=60,
+                check=True,
+            )
+            if not pdf_path.exists() or pdf_path.stat().st_size == 0:
+                raise MarkdownReportGenerationError(
+                    "PDF renderer finished but produced an empty file",
+                    record_id=record_id,
+                )
+            return pdf_path.read_bytes()
+
+    def _enrich_raw_result_from_context_snapshot(self, raw_result: Dict[str, Any], record: Any) -> None:
+        """Backfill display snapshots for older history records."""
+        context_snapshot = parse_json_field(getattr(record, "context_snapshot", None))
+        if not isinstance(context_snapshot, dict):
+            return
+        enhanced_context = context_snapshot.get("enhanced_context")
+        if not isinstance(enhanced_context, dict) or not enhanced_context:
+            return
+
+        def _set_if_missing(key: str, value: Any) -> None:
+            if raw_result.get(key) not in (None, "", [], {}):
+                return
+            if value in (None, "", [], {}):
+                return
+            raw_result[key] = value
+
+        try:
+            from src.analyzer import GeminiAnalyzer
+
+            analyzer = GeminiAnalyzer()
+            _set_if_missing("market_snapshot", analyzer._build_market_snapshot(enhanced_context))
+            _set_if_missing("technical_indicator_snapshot", analyzer._build_technical_indicator_snapshot(enhanced_context))
+            _set_if_missing("macro_snapshot", analyzer._build_macro_snapshot(enhanced_context))
+            _set_if_missing("fundamental_snapshot", analyzer._build_fundamental_snapshot(enhanced_context))
+            _set_if_missing("dividend_snapshot", analyzer._build_dividend_snapshot(enhanced_context))
+            _set_if_missing("peer_valuation_snapshot", analyzer._build_peer_valuation_snapshot(enhanced_context))
+            _set_if_missing("insider_activity_snapshot", analyzer._build_insider_activity_snapshot(enhanced_context))
+            _set_if_missing("filing_references", analyzer._build_filing_references(enhanced_context))
+            news_context = context_snapshot.get("news_content") or getattr(record, "news_content", None)
+            _set_if_missing("news_context_snapshot", news_context)
+            if news_context:
+                raw_result["search_performed"] = True
+        except Exception as exc:
+            logger.debug("Skipping context snapshot enrichment for history report: %s", exc)
 
     def _rebuild_analysis_result(
         self,
@@ -545,6 +700,14 @@ class HistoryService:
                 risk_warning=raw_result.get("risk_warning", ""),
                 buy_reason=raw_result.get("buy_reason", ""),
                 market_snapshot=raw_result.get("market_snapshot"),
+                technical_indicator_snapshot=raw_result.get("technical_indicator_snapshot"),
+                macro_snapshot=raw_result.get("macro_snapshot"),
+                fundamental_snapshot=raw_result.get("fundamental_snapshot"),
+                dividend_snapshot=raw_result.get("dividend_snapshot"),
+                peer_valuation_snapshot=raw_result.get("peer_valuation_snapshot"),
+                insider_activity_snapshot=raw_result.get("insider_activity_snapshot"),
+                filing_references=raw_result.get("filing_references"),
+                news_context_snapshot=raw_result.get("news_context_snapshot"),
                 search_performed=raw_result.get("search_performed", False),
                 data_sources=raw_result.get("data_sources", ""),
                 success=raw_result.get("success", True),
@@ -625,6 +788,9 @@ class HistoryService:
                 report_lines.append("")
                 report_lines.append(f"**🚨 {labels['risk_alerts_label']}**:")
                 for alert in risk_alerts:
+                    alert_text = str(alert)
+                    if "Form 144" in alert_text or "SEC Form" in alert_text:
+                        continue
                     report_lines.append(f"- {alert}")
             # 利好催化
             catalysts = intel.get('positive_catalysts', [])
@@ -638,6 +804,21 @@ class HistoryService:
                 report_lines.append("")
                 report_lines.append(f"**📢 {labels['latest_news_label']}**: {intel['latest_news']}")
             report_lines.append("")
+
+        self._append_notification_sections_to_report(
+            report_lines,
+            result,
+            [
+                "_append_news_context_snapshot",
+                "_append_filing_references",
+                "_append_fundamental_snapshot",
+                "_append_financial_statement_analysis",
+                "_append_dividend_snapshot",
+                "_append_peer_valuation_snapshot",
+                "_append_macro_snapshot",
+                "_append_integrated_research_framework",
+            ],
+        )
 
         # ========== 核心结论 ==========
         core = dashboard.get('core_conclusion', {}) if dashboard else {}
@@ -667,6 +848,11 @@ class HistoryService:
 
         # ========== 行情快照 ==========
         self._append_market_snapshot_to_report(report_lines, result, labels)
+        self._append_notification_sections_to_report(
+            report_lines,
+            result,
+            ["_append_technical_indicator_snapshot"],
+        )
 
         # ========== 数据透视 ==========
         data_persp = dashboard.get('data_perspective', {}) if dashboard else {}
@@ -773,6 +959,9 @@ class HistoryService:
                     "",
                 ])
                 for item in checklist:
+                    item_text = str(item)
+                    if "Form 144" in item_text or "SEC Form" in item_text:
+                        continue
                     report_lines.append(f"- {item}")
                 report_lines.append("")
 
@@ -834,6 +1023,24 @@ class HistoryService:
         if not text or text in ("-", "—", "N/A", "None"):
             return "N/A"
         return text
+
+    @staticmethod
+    def _append_notification_sections_to_report(
+        lines: List[str],
+        result: "AnalysisResult",
+        method_names: List[str],
+    ) -> None:
+        """Reuse report appendix sections from NotificationService for history exports."""
+        try:
+            from src.notification import NotificationService
+
+            helper = NotificationService()
+            for method_name in method_names:
+                method = getattr(helper, method_name, None)
+                if callable(method):
+                    method(lines, result)
+        except Exception as exc:
+            logger.debug("Skipping rich history report sections: %s", exc)
 
     def _get_signal_level(self, result: AnalysisResult) -> Tuple[str, str, str]:
         """Get signal level based on sentiment score and decision type."""

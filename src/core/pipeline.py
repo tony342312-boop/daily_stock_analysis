@@ -27,7 +27,13 @@ from src.storage import get_db
 from data_provider import DataFetcherManager
 from data_provider.base import normalize_stock_code
 from data_provider.realtime_types import ChipDistribution
-from src.analyzer import GeminiAnalyzer, AnalysisResult, fill_chip_structure_if_needed, fill_price_position_if_needed
+from src.analyzer import (
+    GeminiAnalyzer,
+    AnalysisResult,
+    ensure_dashboard_scorecard_payload,
+    fill_chip_structure_if_needed,
+    fill_price_position_if_needed,
+)
 from src.data.stock_mapping import STOCK_NAME_MAP
 from src.notification import NotificationService, NotificationChannel
 from src.report_language import (
@@ -107,12 +113,17 @@ class StockAnalysisPipeline:
             self.search_service = SearchService(
                 bocha_keys=self.config.bocha_api_keys,
                 tavily_keys=self.config.tavily_api_keys,
+                exa_keys=getattr(self.config, "exa_api_keys", []),
                 anspire_keys=self.config.anspire_api_keys,
                 brave_keys=self.config.brave_api_keys,
                 serpapi_keys=self.config.serpapi_keys,
                 minimax_keys=self.config.minimax_api_keys,
                 searxng_base_urls=self.config.searxng_base_urls,
                 searxng_public_instances_enabled=self.config.searxng_public_instances_enabled,
+                ddg_search_enabled=getattr(self.config, "ddg_search_enabled", False),
+                google_news_rss_enabled=getattr(self.config, "google_news_rss_enabled", False),
+                bing_news_rss_enabled=getattr(self.config, "bing_news_rss_enabled", False),
+                multi_search_engine_enabled=getattr(self.config, "multi_search_engine_enabled", False),
                 news_max_age_days=self.config.news_max_age_days,
                 news_strategy_profile=getattr(self.config, "news_strategy_profile", "short"),
             )
@@ -175,6 +186,73 @@ class StockAnalysisPipeline:
                     "query_id": query_id,
                 },
             )
+
+    def _stabilize_nearby_sentiment_score(
+        self,
+        result: AnalysisResult,
+        report_type: ReportType,
+        *,
+        window_minutes: int = 60,
+        tolerance: int = 5,
+    ) -> None:
+        """Keep near-duplicate analyses from drifting by a few points."""
+        code = str(getattr(result, "code", "") or "").strip()
+        if not code:
+            return
+
+        try:
+            current_score = int(getattr(result, "sentiment_score", 50))
+        except (TypeError, ValueError):
+            return
+
+        try:
+            recent_records = self.db.get_analysis_history(
+                code=code,
+                days=1,
+                limit=8,
+                exclude_query_id=getattr(result, "query_id", None),
+            )
+        except Exception as exc:
+            logger.debug("[score-stability] recent history lookup failed for %s: %s", code, exc)
+            return
+
+        cutoff = datetime.now() - timedelta(minutes=window_minutes)
+        normalized_report_type = getattr(report_type, "value", str(report_type))
+
+        for record in recent_records:
+            created_at = getattr(record, "created_at", None)
+            if created_at is None or created_at < cutoff:
+                continue
+            if getattr(record, "report_type", None) not in (None, normalized_report_type):
+                continue
+
+            previous_score = getattr(record, "sentiment_score", None)
+            try:
+                previous_score = int(previous_score)
+            except (TypeError, ValueError):
+                continue
+
+            if abs(current_score - previous_score) > tolerance:
+                continue
+
+            if current_score == previous_score:
+                return
+
+            result.sentiment_score = previous_score
+            dashboard = getattr(result, "dashboard", None)
+            if isinstance(dashboard, dict):
+                dashboard["sentiment_score"] = previous_score
+                scorecard = dashboard.get("scorecard")
+                if isinstance(scorecard, dict):
+                    scorecard["overall_score"] = previous_score
+            logger.info(
+                "[score-stability] %s score locked from %s to recent %s within %s minutes",
+                code,
+                current_score,
+                previous_score,
+                window_minutes,
+            )
+            return
 
     def fetch_and_save_stock_data(
         self, 
@@ -348,7 +426,7 @@ class StockAnalysisPipeline:
                 _mkt = get_market_for_stock(normalize_stock_code(code))
                 frozen = get_frozen_target_date()
                 end_date = frozen if frozen else get_market_now(_mkt).date()
-                start_date = end_date - timedelta(days=89)  # ~60 trading days for MA60
+                start_date = end_date - timedelta(days=370)  # ~250 trading days for MA200 / TradingAgents-style indicators
                 historical_bars = self.db.get_data_range(code, start_date, end_date)
                 if historical_bars:
                     df = pd.DataFrame([bar.to_dict() for bar in historical_bars])
@@ -385,7 +463,7 @@ class StockAnalysisPipeline:
                 intel_results = self.search_service.search_comprehensive_intel(
                     stock_code=code,
                     stock_name=stock_name,
-                    max_searches=5
+                    max_searches=8 if is_us_stock_code(code) else 6,
                 )
 
                 # 格式化情报报告
@@ -496,6 +574,7 @@ class StockAnalysisPipeline:
             # Step 8: 保存分析历史记录
             if result and result.success:
                 try:
+                    self._stabilize_nearby_sentiment_score(result, report_type)
                     self._emit_progress(97, f"{stock_name}：正在保存分析报告")
                     context_snapshot = self._build_context_snapshot(
                         enhanced_context=enhanced_context,
@@ -597,6 +676,15 @@ class StockAnalysisPipeline:
                 'trend_strength': trend_result.trend_strength,
                 'bias_ma5': trend_result.bias_ma5,
                 'bias_ma10': trend_result.bias_ma10,
+                'ma50': trend_result.ma50,
+                'ma200': trend_result.ma200,
+                'ema10': trend_result.ema10,
+                'boll_mid': trend_result.boll_mid,
+                'boll_upper': trend_result.boll_upper,
+                'boll_lower': trend_result.boll_lower,
+                'atr14': trend_result.atr14,
+                'vwma20': trend_result.vwma20,
+                'mfi14': trend_result.mfi14,
                 'volume_status': trend_result.volume_status.value,
                 'volume_trend': trend_result.volume_trend,
                 'buy_signal': trend_result.buy_signal.value,
@@ -860,7 +948,7 @@ class StockAnalysisPipeline:
                     news_response = self.search_service.search_stock_news(
                         stock_code=code,
                         stock_name=resolved_stock_name,
-                        max_results=5
+                        max_results=5,
                     )
                     if news_response.success and news_response.results:
                         query_context = self._build_query_context(query_id=query_id)
@@ -879,6 +967,7 @@ class StockAnalysisPipeline:
             # 保存分析历史记录
             if result and result.success:
                 try:
+                    self._stabilize_nearby_sentiment_score(result, report_type)
                     initial_context["stock_name"] = resolved_stock_name
                     self.db.save_analysis_history(
                         result=result,
@@ -927,10 +1016,14 @@ class StockAnalysisPipeline:
 
         if agent_result.success and agent_result.dashboard:
             dash = agent_result.dashboard
+            normalized_score = ensure_dashboard_scorecard_payload(dash, report_language)
             ai_stock_name = str(dash.get("stock_name", "")).strip()
             if ai_stock_name and self._is_placeholder_stock_name(stock_name, code):
                 result.name = ai_stock_name
-            result.sentiment_score = self._safe_int(dash.get("sentiment_score"), 50)
+            result.sentiment_score = self._safe_int(
+                normalized_score if normalized_score is not None else dash.get("sentiment_score"),
+                50,
+            )
             result.trend_prediction = dash.get("trend_prediction", "Unknown" if report_language == "en" else "未知")
             raw_advice = dash.get("operation_advice", "Watch" if report_language == "en" else "观望")
             if isinstance(raw_advice, dict):

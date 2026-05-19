@@ -148,6 +148,9 @@ class TestNormalizeCode:
     def test_us_ticker(self):
         assert normalize_code("AAPL") == "AAPL"
 
+    def test_us_ticker_with_us_suffix(self):
+        assert normalize_code("meta.us") == "META"
+
     # --- Invalid inputs ---
     def test_empty_returns_none(self):
         assert normalize_code("") is None

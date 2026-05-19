@@ -54,6 +54,7 @@ class SystemConfigApiTestCase(unittest.TestCase):
     def tearDown(self) -> None:
         Config.reset_instance()
         os.environ.pop("DSA_DESKTOP_MODE", None)
+        os.environ.pop("DSA_WEB_CONFIG_WRITE_ENABLED", None)
         os.environ.pop("ENV_FILE", None)
         self.temp_dir.cleanup()
 
@@ -84,6 +85,44 @@ class SystemConfigApiTestCase(unittest.TestCase):
         env_content = self.env_path.read_text(encoding="utf-8")
         self.assertIn("STOCK_LIST=600519,300750", env_content)
         self.assertIn("GEMINI_API_KEY=new-secret-value", env_content)
+
+
+    def test_put_config_returns_forbidden_outside_desktop_mode_by_default(self) -> None:
+        os.environ["DSA_DESKTOP_MODE"] = "false"
+        os.environ.pop("DSA_WEB_CONFIG_WRITE_ENABLED", None)
+        current = system_config.get_system_config(include_schema=False, service=self.service).model_dump()
+
+        with self.assertRaises(HTTPException) as context:
+            system_config.update_system_config(
+                request=UpdateSystemConfigRequest(
+                    config_version=current["config_version"],
+                    reload_now=False,
+                    items=[{"key": "STOCK_LIST", "value": "300750"}],
+                ),
+                service=self.service,
+            )
+
+        self.assertEqual(context.exception.status_code, 403)
+        self.assertEqual(context.exception.detail["error"], "web_config_write_disabled")
+        self.assertIn("STOCK_LIST=600519,000001", self.env_path.read_text(encoding="utf-8"))
+
+    def test_put_config_allows_explicit_web_write_override(self) -> None:
+        os.environ["DSA_DESKTOP_MODE"] = "false"
+        os.environ["DSA_WEB_CONFIG_WRITE_ENABLED"] = "true"
+        current = system_config.get_system_config(include_schema=False, service=self.service).model_dump()
+
+        payload = system_config.update_system_config(
+            request=UpdateSystemConfigRequest(
+                config_version=current["config_version"],
+                reload_now=False,
+                items=[{"key": "STOCK_LIST", "value": "300750"}],
+            ),
+            service=self.service,
+        ).model_dump()
+
+        self.assertTrue(payload["success"])
+        self.assertIn("STOCK_LIST=300750", self.env_path.read_text(encoding="utf-8"))
+        os.environ.pop("DSA_WEB_CONFIG_WRITE_ENABLED", None)
 
     def test_put_config_returns_conflict_when_version_is_stale(self) -> None:
         with self.assertRaises(HTTPException) as context:

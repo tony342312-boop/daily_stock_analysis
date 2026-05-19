@@ -73,4 +73,32 @@ describe('ReportDetails', () => {
     const { container } = render(<ReportDetails />);
     expect(container).toBeEmptyDOMElement();
   });
+
+  it('renders SEC extended financial fields when available', () => {
+    render(
+      <ReportDetails
+        details={{
+          financialReport: {
+            form: '10-Q',
+            report_date: '2026-03-31',
+            revenue: '$42.00B',
+            gross_profit: '$24.00B',
+            gross_margin_pct: 57.14,
+            operating_income: '$18.00B',
+            net_interest_income: '$32.00B',
+            current_ratio: 1.2,
+            stock_repurchases: '$5.00B',
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByText('SEC 扩展字段')).toBeInTheDocument();
+    expect(screen.getByText('毛利')).toBeInTheDocument();
+    expect(screen.getByText('$24.00B')).toBeInTheDocument();
+    expect(screen.getByText('净利息收入')).toBeInTheDocument();
+    expect(screen.getByText('$32.00B')).toBeInTheDocument();
+    expect(screen.getByText('流动比率')).toBeInTheDocument();
+    expect(screen.getByText('1.2')).toBeInTheDocument();
+  });
 });

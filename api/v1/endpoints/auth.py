@@ -20,7 +20,18 @@ from src.auth import (
     create_session,
     get_client_ip,
     has_stored_password,
+    authenticate_user,
+    create_registration_captcha,
+    create_user,
+    ensure_admin_user,
+    get_session_user,
+    verify_registration_captcha,
     is_auth_enabled,
+    is_registration_enabled,
+    is_registration_invite_required,
+    get_registration_invite_code,
+    list_app_users,
+    update_app_user,
     is_password_changeable,
     is_password_set,
     record_login_failure,
@@ -44,9 +55,31 @@ class LoginRequest(BaseModel):
 
     model_config = {"populate_by_name": True}
 
-    password: str = Field(default="", description="Admin password")
+    username: str | None = Field(default=None, description="Username")
+    password: str = Field(default="", description="Password")
     password_confirm: str | None = Field(default=None, alias="passwordConfirm", description="Confirm (first-time)")
 
+
+
+class RegisterRequest(BaseModel):
+    """Register a normal user account."""
+
+    model_config = {"populate_by_name": True}
+
+    username: str = Field(default="")
+    password: str = Field(default="")
+    password_confirm: str = Field(default="", alias="passwordConfirm")
+    captcha_token: str = Field(default="", alias="captchaToken")
+    captcha_answer: str = Field(default="", alias="captchaAnswer")
+    invite_code: str = Field(default="", alias="inviteCode")
+
+
+class UserUpdateRequest(BaseModel):
+    """Admin user-management update request."""
+
+    role: str | None = Field(default=None)
+    status: str | None = Field(default=None)
+    password: str | None = Field(default=None)
 
 class ChangePasswordRequest(BaseModel):
     """Change password request body."""
@@ -156,11 +189,14 @@ def _set_session_cookie(response: Response, session_value: str, request: Request
 
 def _get_auth_status_dict(request: Request | None = None) -> dict:
     """Helper to build consistent auth status response body."""
+    ensure_admin_user()
     auth_enabled = is_auth_enabled()
     logged_in = False
+    current_user = None
     if auth_enabled and request:
         cookie_val = request.cookies.get(COOKIE_NAME)
-        logged_in = verify_session(cookie_val) if cookie_val else False
+        current_user = get_session_user(cookie_val) if cookie_val else None
+        logged_in = current_user is not None
 
     # setupState determination:
     # - enabled: auth is active
@@ -179,6 +215,9 @@ def _get_auth_status_dict(request: Request | None = None) -> dict:
         "passwordSet": _password_set_for_response(auth_enabled),
         "passwordChangeable": is_password_changeable() if auth_enabled else False,
         "setupState": setup_state,
+        "currentUser": current_user,
+        "registrationEnabled": is_registration_enabled(),
+        "registrationInviteRequired": is_registration_invite_required(),
     }
 
 
@@ -354,6 +393,84 @@ async def auth_update_settings(request: Request, body: AuthSettingsRequest):
 
 
 
+@router.get(
+    "/captcha",
+    summary="Create registration captcha",
+    description="Returns a signed arithmetic captcha challenge for registration.",
+)
+async def auth_captcha():
+    challenge = create_registration_captcha()
+    # Do not expose the answer to the browser.
+    challenge.pop("answer", None)
+    return challenge
+
+
+@router.post(
+    "/register",
+    summary="Register normal user",
+    description="Register a normal user account after captcha verification.",
+)
+async def auth_register(request: Request, body: RegisterRequest):
+    if not is_auth_enabled():
+        return JSONResponse(status_code=400, content={"error": "auth_disabled", "message": "Authentication is not configured"})
+    if not is_registration_enabled():
+        return JSONResponse(status_code=403, content={"error": "registration_disabled", "message": "当前服务器已关闭普通用户注册"})
+    invite_code = get_registration_invite_code()
+    if invite_code and (body.invite_code or "").strip() != invite_code:
+        return JSONResponse(status_code=403, content={"error": "invalid_invite_code", "message": "邀请码错误"})
+    if not verify_registration_captcha(body.captcha_token, body.captcha_answer):
+        return JSONResponse(status_code=400, content={"error": "invalid_captcha", "message": "验证码错误或已过期"})
+    password = (body.password or "").strip()
+    confirm = (body.password_confirm or "").strip()
+    if password != confirm:
+        return JSONResponse(status_code=400, content={"error": "password_mismatch", "message": "两次输入的密码不一致"})
+    try:
+        user = create_user(body.username, password, role="user")
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": "invalid_registration", "message": str(exc)})
+    session_val = create_session({"id": user.id, "username": user.username, "role": user.role})
+    resp = JSONResponse(content={"ok": True, "user": {"id": user.id, "username": user.username, "role": user.role}})
+    _set_session_cookie(resp, session_val, request)
+    return resp
+
+
+def _require_admin(request: Request):
+    current_user = getattr(request.state, "current_user", None) or {}
+    if current_user.get("role") != "admin":
+        return JSONResponse(status_code=403, content={"error": "forbidden", "message": "仅管理员可执行此操作"})
+    return None
+
+
+@router.get(
+    "/users",
+    summary="List Web users",
+    description="Admin-only user-management list without password hashes.",
+)
+async def auth_list_users(request: Request):
+    forbidden = _require_admin(request)
+    if forbidden:
+        return forbidden
+    ensure_admin_user()
+    items = list_app_users()
+    return {"total": len(items), "items": items}
+
+
+@router.patch(
+    "/users/{user_id}",
+    summary="Update Web user",
+    description="Admin-only user-management update for role/status/password reset.",
+)
+async def auth_update_user(user_id: int, request: Request, body: UserUpdateRequest):
+    forbidden = _require_admin(request)
+    if forbidden:
+        return forbidden
+    try:
+        user = update_app_user(user_id, role=body.role, status=body.status, password=body.password)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": "invalid_user_update", "message": str(exc)})
+    return {"ok": True, "user": user}
+
+
 @router.post(
     "/login",
     summary="Login or set initial password",
@@ -384,34 +501,35 @@ async def auth_login(request: Request, body: LoginRequest):
             },
         )
 
-    password_set = is_password_set()
-
-    if not password_set:
-        # First-time setup: require passwordConfirm
-        confirm = (body.password_confirm or "").strip()
-        if password != confirm:
+    ensure_admin_user()
+    username = (body.username or "").strip()
+    session_user = None
+    if username:
+        session_user = authenticate_user(username, password)
+        if not session_user:
             record_login_failure(ip)
-            return JSONResponse(
-                status_code=400,
-                content={"error": "password_mismatch", "message": "Passwords do not match"},
-            )
-        err = set_initial_password(password)
-        if err:
-            record_login_failure(ip)
-            return JSONResponse(
-                status_code=400,
-                content={"error": "invalid_password", "message": err},
-            )
+            return JSONResponse(status_code=401, content={"error": "invalid_password", "message": "用户名或密码错误"})
     else:
-        if not verify_password(password):
-            record_login_failure(ip)
-            return JSONResponse(
-                status_code=401,
-                content={"error": "invalid_password", "message": "密码错误"},
-            )
+        # Backward-compatible admin-only login path for existing tests/legacy deployments.
+        password_set = is_password_set()
+        if not password_set:
+            confirm = (body.password_confirm or "").strip()
+            if password != confirm:
+                record_login_failure(ip)
+                return JSONResponse(status_code=400, content={"error": "password_mismatch", "message": "Passwords do not match"})
+            err = set_initial_password(password)
+            if err:
+                record_login_failure(ip)
+                return JSONResponse(status_code=400, content={"error": "invalid_password", "message": err})
+            session_user = {"id": None, "username": "admin", "role": "admin"}
+        else:
+            if not verify_password(password):
+                record_login_failure(ip)
+                return JSONResponse(status_code=401, content={"error": "invalid_password", "message": "密码错误"})
+            session_user = {"id": None, "username": "admin", "role": "admin"}
 
     clear_rate_limit(ip)
-    session_val = create_session()
+    session_val = create_session(session_user)
     if not session_val:
         return JSONResponse(
             status_code=500,

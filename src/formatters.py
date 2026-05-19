@@ -115,7 +115,7 @@ def markdown_to_html_document(markdown_text: str) -> str:
 
     css_style = """
             body {
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+                font-family: "Noto Sans CJK SC", "Noto Color Emoji", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
                 line-height: 1.5;
                 color: #24292e;
                 font-size: 14px;

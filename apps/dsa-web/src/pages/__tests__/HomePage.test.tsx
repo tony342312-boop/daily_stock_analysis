@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { analysisApi, DuplicateTaskError } from '../../api/analysis';
+import { feedbackApi } from '../../api/feedback';
 import { historyApi } from '../../api/history';
 import { useStockPoolStore } from '../../stores';
 import { getReportText, normalizeReportLanguage } from '../../utils/reportLanguage';
@@ -17,6 +18,11 @@ vi.mock('react-router-dom', async () => {
   };
 });
 
+
+vi.mock('../../contexts/AuthContext', () => ({
+  useAuth: () => ({ currentUser: { id: 7, username: 'alice', role: 'user' } }),
+}));
+
 vi.mock('../../api/history', () => ({
   historyApi: {
     getList: vi.fn(),
@@ -24,6 +30,13 @@ vi.mock('../../api/history', () => ({
     deleteRecords: vi.fn(),
     getNews: vi.fn().mockResolvedValue({ total: 0, items: [] }),
     getMarkdown: vi.fn().mockResolvedValue('# report'),
+  },
+}));
+
+
+vi.mock('../../api/feedback', () => ({
+  feedbackApi: {
+    submit: vi.fn(),
   },
 }));
 
@@ -215,6 +228,53 @@ describe('HomePage', () => {
     });
   });
 
+
+  it('lets users submit feedback from the main page and sends it to the backend', async () => {
+    vi.mocked(historyApi.getList).mockResolvedValue({
+      total: 0,
+      page: 1,
+      limit: 20,
+      items: [],
+    });
+    vi.mocked(feedbackApi.submit).mockResolvedValue({ ok: true, notificationSent: false });
+
+    render(
+      <MemoryRouter>
+        <HomePage />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '反馈问题' }));
+    expect(screen.queryByText('提交后会自动发送到飞书，便于我们判断是否真实、合理并汇总修复。')).not.toBeInTheDocument();
+    expect(screen.queryByRole('combobox', { name: '问题类型' })).not.toBeInTheDocument();
+    const categoryTrigger = screen.getByRole('button', { name: '问题类型 Bug / 功能异常' });
+    expect(categoryTrigger).toHaveAttribute('aria-haspopup', 'listbox');
+    expect(screen.queryByRole('listbox', { name: '问题类型' })).not.toBeInTheDocument();
+    fireEvent.click(categoryTrigger);
+    expect(screen.getByRole('listbox', { name: '问题类型' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'Bug / 功能异常' })).toBeInTheDocument();
+    const iterationOption = screen.getByRole('option', { name: '迭代建议' });
+    expect(iterationOption).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: '其他' })).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: '数据/报告问题' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: '产品建议' })).not.toBeInTheDocument();
+    fireEvent.click(iterationOption);
+    fireEvent.change(screen.getByLabelText('问题描述'), { target: { value: '希望增加批量导出能力' } });
+    fireEvent.change(screen.getByLabelText('联系方式（选填）'), { target: { value: 'alice@example.com' } });
+    fireEvent.click(screen.getByRole('button', { name: '提交反馈' }));
+
+    await waitFor(() => {
+      expect(feedbackApi.submit).toHaveBeenCalledWith({
+        category: 'iteration',
+        content: '希望增加批量导出能力',
+        contact: 'alice@example.com',
+        pageUrl: expect.stringContaining('/'),
+      });
+    });
+    expect(await screen.findByText('已接收，反馈已提交。')).toBeInTheDocument();
+    expect(screen.queryByText(/飞书通知暂未发送成功/)).not.toBeInTheDocument();
+  });
+
   it('opens and closes the mobile history drawer without changing dashboard styles', async () => {
     vi.mocked(historyApi.getList).mockResolvedValue({
       total: 0,
@@ -233,7 +293,12 @@ describe('HomePage', () => {
     fireEvent.click(trigger);
 
     expect(container.querySelector('.page-drawer-overlay')).toBeTruthy();
-    expect(container.querySelector('.dashboard-card')).toBeTruthy();
+    const drawer = container.querySelector('.dashboard-card') as HTMLElement;
+    expect(drawer).toBeTruthy();
+    expect(drawer.className).toContain('h-[100dvh]');
+    expect(drawer.className).toContain('!overflow-y-auto');
+    expect(drawer.className).toContain('touch-pan-y');
+    expect(drawer.className).toContain('[-webkit-overflow-scrolling:touch]');
 
     fireEvent.click(container.querySelector('.fixed.inset-0.z-40') as HTMLElement);
 

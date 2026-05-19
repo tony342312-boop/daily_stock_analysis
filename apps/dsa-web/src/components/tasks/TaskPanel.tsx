@@ -1,13 +1,20 @@
 import type React from 'react';
+import { useEffect, useState } from 'react';
 import { Badge, Card, StatusDot } from '../common';
 import { DashboardPanelHeader } from '../dashboard';
-import type { TaskInfo } from '../../types/analysis';
+import type { NewsIntelItem, TaskInfo } from '../../types/analysis';
+import { historyApi } from '../../api/history';
 
 /**
  * 任务项组件属性
  */
 interface TaskItemProps {
   task: TaskInfo;
+}
+
+interface NewsPreviewState {
+  taskId: string;
+  items: NewsIntelItem[];
 }
 
 /**
@@ -20,57 +27,124 @@ const TaskItem: React.FC<TaskItemProps> = ({ task }) => {
   const statusVariant = isProcessing ? 'info' : 'default';
   const statusTone = isProcessing ? 'info' : 'neutral';
   const progress = Math.max(0, Math.min(100, task.progress || 0));
+  const shouldLoadNewsPreview = isProcessing && progress >= 46;
+  const [newsPreview, setNewsPreview] = useState<NewsPreviewState>({
+    taskId: '',
+    items: [],
+  });
+  const newsItems = (
+    shouldLoadNewsPreview && newsPreview.taskId === task.taskId ? newsPreview.items : []
+  );
+
+  useEffect(() => {
+    if (!shouldLoadNewsPreview) {
+      return undefined;
+    }
+
+    let cancelled = false;
+
+    const loadNewsPreview = async () => {
+      try {
+        const response = await historyApi.getNews(task.taskId, 4);
+        if (!cancelled) {
+          setNewsPreview({
+            taskId: task.taskId,
+            items: response.items || [],
+          });
+        }
+      } catch {
+        if (!cancelled) {
+          setNewsPreview({
+            taskId: task.taskId,
+            items: [],
+          });
+        }
+      }
+    };
+
+    void loadNewsPreview();
+    const timerId = window.setInterval(loadNewsPreview, 12000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timerId);
+    };
+  }, [shouldLoadNewsPreview, task.taskId]);
 
   return (
-    <div className="home-subpanel flex items-center gap-3 px-3 py-2.5">
-      {/* 状态图标 */}
-      <div className="shrink-0">
-        {isProcessing ? (
-          <StatusDot tone="info" pulse className="h-2.5 w-2.5" aria-label="任务进行中" />
-        ) : isPending ? (
-          <StatusDot tone="neutral" className="h-2.5 w-2.5" aria-label="任务等待中" />
-        ) : null}
-      </div>
-
-      {/* 任务信息 */}
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-2">
-          <span className="text-sm font-medium text-foreground truncate">
-            {task.stockName || task.stockCode}
-          </span>
-          <span className="text-xs text-muted-text">
-            {task.stockCode}
-          </span>
+    <div className="home-subpanel px-3 py-2.5">
+      <div className="flex items-center gap-3">
+        {/* 状态图标 */}
+        <div className="shrink-0">
+          {isProcessing ? (
+            <StatusDot tone="info" pulse className="h-2.5 w-2.5" aria-label="任务进行中" />
+          ) : isPending ? (
+            <StatusDot tone="neutral" className="h-2.5 w-2.5" aria-label="任务等待中" />
+          ) : null}
         </div>
-        {task.message && (
-          <p className="text-xs text-secondary-text truncate mt-0.5">
-            {task.message}
-          </p>
-        )}
-        <div className="mt-2 flex items-center gap-2">
-          <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-white/8">
-            <div
-              className="h-full rounded-full bg-cyan transition-[width] duration-300 ease-out"
-              style={{ width: `${progress}%` }}
-            />
+
+        {/* 任务信息 */}
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-medium text-foreground truncate">
+              {task.stockName || task.stockCode}
+            </span>
+            <span className="text-xs text-muted-text">
+              {task.stockCode}
+            </span>
           </div>
-          <span className="shrink-0 text-[11px] text-muted-text tabular-nums">
-            {progress}%
-          </span>
+          {task.message && (
+            <p className="text-xs text-secondary-text truncate mt-0.5">
+              {task.message}
+            </p>
+          )}
+          <div className="mt-2 flex items-center gap-2">
+            <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-white/8">
+              <div
+                className="h-full rounded-full bg-cyan transition-[width] duration-300 ease-out"
+                style={{ width: `${progress}%` }}
+              />
+            </div>
+            <span className="shrink-0 text-[11px] text-muted-text tabular-nums">
+              {progress}%
+            </span>
+          </div>
+        </div>
+
+        {/* 状态标签 */}
+        <div className="flex-shrink-0">
+          <Badge
+            variant={statusVariant}
+            className="min-w-[4.75rem] justify-center gap-1.5 shadow-none"
+            aria-label={`任务状态：${statusLabel}`}
+          >
+            <StatusDot tone={statusTone} pulse={isProcessing} className="h-1.5 w-1.5" />
+            {statusLabel}
+          </Badge>
         </div>
       </div>
 
-      {/* 状态标签 */}
-      <div className="flex-shrink-0">
-        <Badge
-          variant={statusVariant}
-          className="min-w-[4.75rem] justify-center gap-1.5 shadow-none"
-          aria-label={`任务状态：${statusLabel}`}
-        >
-          <StatusDot tone={statusTone} pulse={isProcessing} className="h-1.5 w-1.5" />
-          {statusLabel}
-        </Badge>
-      </div>
+      {newsItems.length > 0 && (
+        <div className="mt-3 border-t border-subtle pt-2">
+          <div className="mb-1.5 text-[11px] font-medium text-muted-text">已检索内容</div>
+          <div className="space-y-1.5">
+            {newsItems.map((item, index) => (
+              <a
+                key={`${item.url || item.title}-${index}`}
+                href={item.url}
+                target="_blank"
+                rel="noreferrer"
+                className="block rounded-md bg-white/5 px-2.5 py-2 text-xs hover:bg-white/8"
+              >
+                <span className="block truncate text-foreground">{item.title}</span>
+                {item.snippet ? (
+                  <span className="mt-0.5 block line-clamp-2 text-muted-text">{item.snippet}</span>
+                ) : null}
+              </a>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 };

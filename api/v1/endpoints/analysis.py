@@ -23,7 +23,7 @@ import re
 from datetime import datetime
 from typing import Optional, Union, Dict, Any
 
-from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi import APIRouter, HTTPException, Depends, Query, Request as FastAPIRequest
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from api.deps import get_config_dep
@@ -68,7 +68,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-_SUPPORTED_FREE_TEXT_RE = re.compile(r"^[A-Za-z0-9.*\-+\u3400-\u9fff\s]+$")
+_SUPPORTED_FREE_TEXT_RE = re.compile(r"^[A-Za-z0-9.*\-+&/\u3400-\u9fff\s]+$")
 
 
 def _invalid_analysis_input_error() -> HTTPException:
@@ -106,15 +106,21 @@ def _resolve_and_normalize_input(raw_value: str) -> str:
     if not text:
         return ""
 
-    if is_code_like(text):
-        return canonical_stock_code(text)
-
     if _is_obviously_invalid_analysis_input(text):
         raise _invalid_analysis_input_error()
 
     resolved = resolve_name_to_code(text)
     if resolved:
-        return canonical_stock_code(resolved)
+        canonical = canonical_stock_code(resolved)
+        if re.fullmatch(r"[A-Z]{1,5}\.US", canonical):
+            return canonical_stock_code(normalize_stock_code(canonical))
+        return canonical
+
+    if is_code_like(text):
+        canonical = canonical_stock_code(text)
+        if re.fullmatch(r"[A-Z]{1,5}\.US", canonical):
+            return canonical_stock_code(normalize_stock_code(canonical))
+        return canonical
 
     raise _invalid_analysis_input_error()
 
@@ -141,6 +147,7 @@ def _resolve_and_normalize_input(raw_value: str) -> str:
 )
 def trigger_analysis(
         request: AnalyzeRequest,
+        http_request: FastAPIRequest = None,
         config: Config = Depends(get_config_dep)
 ) -> Union[AnalysisResultResponse, JSONResponse]:
     """
@@ -228,15 +235,16 @@ def trigger_analysis(
                     "message": "同步模式仅支持单只股票分析，请使用 async_mode=true 进行批量分析"
                 }
             )
-        return _handle_sync_analysis(stock_codes[0], request)
+        return _handle_sync_analysis(stock_codes[0], request, http_request)
 
     # Async mode submits one task per stock.
-    return _handle_async_analysis_batch(stock_codes, request)
+    return _handle_async_analysis_batch(stock_codes, request, http_request)
 
 
 def _handle_async_analysis_batch(
     stock_codes: list,
-    request: AnalyzeRequest
+    request: AnalyzeRequest,
+    http_request: FastAPIRequest | None = None,
 ) -> JSONResponse:
     """
     Handle asynchronous analysis requests, including batch submission.
@@ -263,6 +271,8 @@ def _handle_async_analysis_batch(
         force_refresh=request.force_refresh,
         notify=notify,
     )
+    if http_request is not None:
+        submit_kwargs["user_context"] = getattr(http_request.state, "current_user", None)
 
     accepted_tasks, duplicate_errors = task_queue.submit_tasks_batch(**submit_kwargs)
 
@@ -324,7 +334,8 @@ def _handle_async_analysis_batch(
 
 def _handle_sync_analysis(
     stock_code: str,
-    request: AnalyzeRequest
+    request: AnalyzeRequest,
+    http_request: FastAPIRequest | None = None,
 ) -> AnalysisResultResponse:
     """
     处理同步分析请求
@@ -338,13 +349,18 @@ def _handle_sync_analysis(
     
     try:
         service = AnalysisService()
-        result = service.analyze_stock(
-            stock_code=stock_code,
-            report_type=request.report_type,
-            force_refresh=request.force_refresh,
-            query_id=query_id,
-            send_notification=getattr(request, "notify", True),
-        )
+        from src.auth import reset_current_user_context, set_current_user_context
+        token = set_current_user_context(getattr(http_request.state, "current_user", None) if http_request is not None else None)
+        try:
+            result = service.analyze_stock(
+                stock_code=stock_code,
+                report_type=request.report_type,
+                force_refresh=request.force_refresh,
+                query_id=query_id,
+                send_notification=getattr(request, "notify", True),
+            )
+        finally:
+            reset_current_user_context(token)
 
         if result is None:
             error_message = service.last_error or f"分析股票 {stock_code} 失败"
@@ -494,7 +510,12 @@ async def task_stream():
     async def event_generator():
         task_queue = get_task_queue()
         event_queue: asyncio.Queue = asyncio.Queue()
-        
+
+        # Some public tunnels/proxies buffer tiny SSE chunks. A leading comment
+        # padding nudges them to flush the stream so remote browsers can see
+        # progress immediately instead of only after the task finishes.
+        yield _format_sse_comment("stream-padding " + (" " * 2048))
+
         # 发送连接成功事件
         yield _format_sse_event("connected", {"message": "Connected to task stream"})
         
@@ -510,7 +531,7 @@ async def task_stream():
             while True:
                 try:
                     # 等待事件，超时发送心跳
-                    event = await asyncio.wait_for(event_queue.get(), timeout=30)
+                    event = await asyncio.wait_for(event_queue.get(), timeout=10)
                     yield _format_sse_event(event["type"], event["data"])
                 except asyncio.TimeoutError:
                     # 心跳
@@ -527,11 +548,15 @@ async def task_stream():
         event_generator(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",  # 禁用 Nginx 缓冲
         }
     )
+
+
+def _format_sse_comment(comment: str) -> str:
+    return f": {comment}\n\n"
 
 
 def _format_sse_event(event_type: str, data: Dict[str, Any]) -> str:

@@ -33,10 +33,12 @@ def _add_lookup_key(keys: set[str], value: str) -> None:
     keys.add(candidate.upper())
 
 
-def _build_lookup_keys(canonical_code: str, display_code: str) -> Iterable[str]:
+def _build_lookup_keys(canonical_code: str, display_code: str, aliases: Iterable[str] | None = None) -> Iterable[str]:
     keys: set[str] = set()
     _add_lookup_key(keys, canonical_code)
     _add_lookup_key(keys, display_code)
+    for alias in aliases or []:
+        _add_lookup_key(keys, alias)
 
     canonical_upper = str(canonical_code or "").strip().upper()
     display_upper = str(display_code or "").strip().upper()
@@ -76,10 +78,11 @@ def _load_stock_index_file(index_path: Path) -> Dict[str, str]:
             continue
 
         canonical_code, display_code, name_zh = item[0], item[1], item[2]
+        aliases = item[5] if len(item) > 5 and isinstance(item[5], list) else []
         if not is_meaningful_stock_name(name_zh, str(display_code or canonical_code or "")):
             continue
 
-        for key in _build_lookup_keys(str(canonical_code or ""), str(display_code or "")):
+        for key in _build_lookup_keys(str(canonical_code or ""), str(display_code or ""), aliases):
             stock_name_map[key] = str(name_zh).strip()
 
     return stock_name_map
