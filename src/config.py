@@ -833,6 +833,12 @@ class Config:
     sec_edgar_user_agent: str = "daily_stock_analysis/1.0 admin@stock.cn.mt"
     sec_edgar_timeout_seconds: float = 15.0
 
+    # === FRED macro context (US stocks only) ===
+    fred_api_key: Optional[str] = None
+    fred_enabled: bool = True
+    fred_timeout_seconds: float = 6.0
+    fred_cache_ttl_seconds: int = 900
+
     # === Peer valuation context ===
     peer_valuation_enabled: bool = True
     peer_valuation_timeout_seconds: float = 10.0
@@ -1650,6 +1656,20 @@ class Config:
                 15.0,
                 field_name='SEC_EDGAR_TIMEOUT_SECONDS',
                 minimum=1.0,
+            ),
+            fred_api_key=os.getenv('FRED_API_KEY'),
+            fred_enabled=os.getenv('FRED_ENABLED', 'true').lower() == 'true',
+            fred_timeout_seconds=parse_env_float(
+                os.getenv('FRED_TIMEOUT_SECONDS'),
+                6.0,
+                field_name='FRED_TIMEOUT_SECONDS',
+                minimum=1.0,
+            ),
+            fred_cache_ttl_seconds=parse_env_int(
+                os.getenv('FRED_CACHE_TTL_SECONDS'),
+                900,
+                field_name='FRED_CACHE_TTL_SECONDS',
+                minimum=60,
             ),
             peer_valuation_enabled=os.getenv('PEER_VALUATION_ENABLED', 'true').lower() == 'true',
             peer_valuation_timeout_seconds=parse_env_float(

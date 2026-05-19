@@ -608,6 +608,8 @@ class DataFetcherManager:
         self._tickflow_lock = RLock()
         self._fundamental_cache: Dict[str, Dict[str, Any]] = {}
         self._fundamental_cache_lock = RLock()
+        self._macro_context_cache: Dict[str, Any] = {}
+        self._macro_context_cache_lock = RLock()
         self._fundamental_timeout_worker_limit = 8
         self._fundamental_timeout_slots = BoundedSemaphore(self._fundamental_timeout_worker_limit)
 
@@ -625,6 +627,10 @@ class DataFetcherManager:
             self._stock_name_cache = {}
         if not hasattr(self, "_stock_name_cache_lock") or self._stock_name_cache_lock is None:
             self._stock_name_cache_lock = RLock()
+        if not hasattr(self, "_macro_context_cache") or self._macro_context_cache is None:
+            self._macro_context_cache = {}
+        if not hasattr(self, "_macro_context_cache_lock") or self._macro_context_cache_lock is None:
+            self._macro_context_cache_lock = RLock()
 
     def _get_fetchers_snapshot(self) -> List[BaseFetcher]:
         self._ensure_concurrency_guards()
@@ -2446,6 +2452,68 @@ class DataFetcherManager:
             errors.append(err_msg)
         return payload, chain, errors
 
+    def _get_fred_macro_context(self, config: Any) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[str]]:
+        """Fetch and cache FRED macro context once per short window."""
+        if not getattr(config, "fred_enabled", True):
+            return {}, [{"provider": "fred", "result": "disabled", "duration_ms": 0}], []
+        if not getattr(config, "fred_api_key", None):
+            return (
+                {
+                    "provider": "FRED",
+                    "status": "not_configured",
+                    "indicators": {},
+                    "errors": ["FRED_API_KEY is not configured"],
+                },
+                [{"provider": "fred", "result": "not_configured", "duration_ms": 0}],
+                [],
+            )
+
+        cache_ttl = max(60, int(getattr(config, "fred_cache_ttl_seconds", 900) or 900))
+        cache_key = "fred_macro_context"
+        self._ensure_concurrency_guards()
+        with self._macro_context_cache_lock:
+            cached = self._macro_context_cache.get(cache_key)
+            if cached and (time.time() - float(cached.get("ts", 0))) <= cache_ttl:
+                return (
+                    cached.get("payload", {}),
+                    cached.get("source_chain", []),
+                    cached.get("errors", []),
+                )
+
+        from data_provider.fred_macro import FredMacroClient
+
+        timeout = max(1.0, float(getattr(config, "fred_timeout_seconds", 6.0) or 6.0))
+        client = FredMacroClient(
+            api_key=getattr(config, "fred_api_key", ""),
+            timeout=timeout,
+        )
+        payload, err_msg, elapsed_ms = self._run_with_retry(
+            client.get_macro_context,
+            timeout,
+            "fred_macro_context",
+        )
+        if not isinstance(payload, dict):
+            return {}, [{"provider": "fred", "result": "failed", "duration_ms": elapsed_ms}], [err_msg or "FRED unavailable"]
+
+        chain = self._normalize_source_chain(
+            payload.get("source_chain", []),
+            "fred",
+            str(payload.get("status", "partial")),
+            elapsed_ms,
+        )
+        payload_errors = payload.get("errors", [])
+        errors = list(payload_errors) if isinstance(payload_errors, list) else []
+        if err_msg:
+            errors.append(err_msg)
+        with self._macro_context_cache_lock:
+            self._macro_context_cache[cache_key] = {
+                "ts": time.time(),
+                "payload": payload,
+                "source_chain": chain,
+                "errors": errors,
+            }
+        return payload, chain, errors
+
     def _get_us_fundamental_context(self, stock_code: str) -> Dict[str, Any]:
         """Build a fail-open US fundamental context from SEC EDGAR and quotes."""
         from src.config import get_config
@@ -2614,12 +2682,14 @@ class DataFetcherManager:
                 ["US board membership block not implemented"],
             ),
         }
+        macro_payload, macro_chain, macro_errors = self._get_fred_macro_context(config)
         peer_payload, peer_chain, peer_errors = self._get_peer_valuation_context_for_market(
             ticker,
             "us",
             config,
         )
         coverage = {block: blocks[block]["status"] for block in blocks}
+        coverage["macro"] = str(macro_payload.get("status", "not_configured")) if macro_payload else "not_configured"
         coverage["peer_valuation"] = str(peer_payload.get("status", "not_configured")) if peer_payload else "not_configured"
         if all(value == "not_supported" for value in coverage.values()):
             status = "not_supported"
@@ -2633,6 +2703,8 @@ class DataFetcherManager:
         for block in blocks.values():
             source_chain.extend(block.get("source_chain", []))
             errors.extend(block.get("errors", []))
+        source_chain.extend(macro_chain)
+        errors.extend(macro_errors)
         source_chain.extend(peer_chain)
         errors.extend(peer_errors)
         if sec_err_msg:
@@ -2647,6 +2719,7 @@ class DataFetcherManager:
             "company_name": sec_payload.get("company_name"),
             "sec_edgar": sec_payload,
             "quote": quote_dict,
+            "macro": macro_payload,
             "peer_valuation": peer_payload,
             "coverage": coverage,
             "source_chain": source_chain,
