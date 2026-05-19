@@ -120,6 +120,29 @@ def normalize_stock_code(stock_code: str) -> str:
 
 
 ETF_PREFIXES = ("51", "52", "56", "58", "15", "16", "18")
+KNOWN_US_ETF_SYMBOLS = {
+    "ARKK",
+    "DIA",
+    "DRAM",
+    "GLD",
+    "HYG",
+    "IWM",
+    "LQD",
+    "QQQ",
+    "SLV",
+    "SMH",
+    "SOXX",
+    "SPY",
+    "TLT",
+    "VTI",
+    "VOO",
+    "XLF",
+    "XLK",
+    "XLP",
+    "XLU",
+    "XLV",
+    "XLY",
+}
 
 
 def _is_us_market(code: str) -> bool:
@@ -155,6 +178,33 @@ def _is_etf_code(code: str) -> bool:
         normalized.isdigit()
         and len(normalized) == 6
         and normalized.startswith(ETF_PREFIXES)
+    )
+
+
+def _is_known_us_etf_code(code: str) -> bool:
+    """Return true for common US ETF/ETN symbols that should skip company financials."""
+    normalized = normalize_stock_code(code).strip().upper()
+    return normalized in KNOWN_US_ETF_SYMBOLS
+
+
+def _looks_like_us_etf_name(name: str) -> bool:
+    """Infer fund-like US instruments from quote/display names."""
+    normalized = (name or "").strip().upper()
+    if not normalized:
+        return False
+    return any(
+        keyword in normalized
+        for keyword in (
+            " ETF",
+            "ETF ",
+            "ETF-",
+            "-ETF",
+            " EXCHANGE TRADED FUND",
+            " ETN",
+            "ETN ",
+            " FUND",
+            "FUND ",
+        )
     )
 
 
@@ -2148,6 +2198,194 @@ class DataFetcherManager:
             **blocks,
         }
 
+    def _build_etf_fundamental_context(
+        self,
+        stock_code: str,
+        market: str,
+        config: Any,
+        quote_payload: Any = None,
+        reason: Optional[str] = None,
+        start_ts: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Build a fund-aware context for ETFs without pretending they have company statements."""
+        from data_provider.etf_context import EtfContextClient
+
+        started = start_ts if start_ts is not None else time.time()
+        symbol = normalize_stock_code(stock_code).strip().upper()
+        fetch_timeout = max(
+            0.0,
+            float(getattr(config, "fundamental_fetch_timeout_seconds", 3.0) or 3.0),
+        )
+        source_chain: List[Dict[str, Any]] = []
+        errors: List[str] = [reason] if reason else []
+        quote_err_msg = ""
+        quote_ms = 0
+
+        if quote_payload is None and fetch_timeout > 0:
+            quote_payload, quote_err_msg, quote_ms = self._run_with_retry(
+                lambda: self.get_realtime_quote(symbol, log_final_failure=False),
+                fetch_timeout,
+                "etf_realtime_quote",
+            )
+            source_chain.extend(
+                self._normalize_source_chain(
+                    [{"provider": "realtime_quote", "result": "partial" if quote_payload else "failed", "duration_ms": quote_ms}],
+                    "realtime_quote",
+                    "partial" if quote_payload else "failed",
+                    quote_ms,
+                )
+            )
+        elif quote_payload is not None:
+            source_chain.extend(
+                self._normalize_source_chain(
+                    [{"provider": "realtime_quote", "result": "partial", "duration_ms": 0}],
+                    "realtime_quote",
+                    "partial",
+                    0,
+                )
+            )
+        if quote_err_msg:
+            errors.append(quote_err_msg)
+
+        etf_timeout = max(1.0, min(4.0, fetch_timeout or 1.0))
+        client = EtfContextClient(timeout=etf_timeout)
+        etf_payload, etf_err_msg, etf_ms = self._run_with_retry(
+            lambda: client.get_context(symbol, market, quote_payload),
+            etf_timeout,
+            "etf_context",
+        )
+        if not isinstance(etf_payload, dict):
+            etf_payload = {
+                "provider": "etf_context",
+                "status": "not_supported",
+                "asset_type": "etf",
+                "market": market,
+                "symbol": symbol,
+                "quote": {},
+                "fund_profile": {
+                    "asset_type": "etf",
+                    "symbol": symbol,
+                    "market": market,
+                    "statement_model": "fund",
+                    "company_financial_report_applicable": False,
+                },
+                "liquidity": {},
+                "errors": [etf_err_msg or "ETF context unavailable"],
+                "source_chain": [],
+            }
+        source_chain.extend(
+            self._normalize_source_chain(
+                etf_payload.get("source_chain", []),
+                "etf_context",
+                str(etf_payload.get("status", "not_supported")),
+                etf_ms,
+            )
+        )
+        errors.extend(str(item) for item in etf_payload.get("errors", []) if item)
+        if etf_err_msg:
+            errors.append(etf_err_msg)
+
+        quote_dict = etf_payload.get("quote", {})
+        if not isinstance(quote_dict, dict):
+            quote_dict = {}
+        fund_profile = etf_payload.get("fund_profile", {})
+        if not isinstance(fund_profile, dict):
+            fund_profile = {}
+        liquidity = etf_payload.get("liquidity", {})
+        if not isinstance(liquidity, dict):
+            liquidity = {}
+
+        valuation_payload = {
+            "quote": quote_dict,
+            "liquidity": liquidity,
+            "fund_profile": fund_profile,
+        }
+        fund_context_payload = {
+            "fund_profile": fund_profile,
+            "holdings": etf_payload.get("holdings", {}),
+            "exposure": etf_payload.get("exposure", {}),
+            "operations": etf_payload.get("operations", {}),
+            "data_needs": fund_profile.get("data_needs", []),
+        }
+        valuation_status = self._infer_block_status(
+            {
+                "quote": quote_dict,
+                "liquidity": liquidity,
+                "holdings": fund_context_payload["holdings"],
+                "exposure": fund_context_payload["exposure"],
+                "operations": fund_context_payload["operations"],
+            },
+            "partial" if quote_dict or liquidity else "not_supported",
+        )
+        not_applicable_report = {
+            "source": "not_applicable",
+            "reason": "ETF/fund products do not publish operating-company financial statements.",
+        }
+        blocks = {
+            "valuation": self._build_fundamental_block(
+                valuation_status,
+                valuation_payload,
+                source_chain,
+                errors,
+            ),
+            "growth": self._build_fundamental_block(
+                "not_supported",
+                {"fund_context": fund_context_payload},
+                source_chain,
+                ["ETF growth should be analyzed via holdings, exposure, flows, and NAV/tracking data."],
+            ),
+            "earnings": self._build_fundamental_block(
+                "not_supported",
+                {
+                    "financial_report": not_applicable_report,
+                    "fund_context": fund_context_payload,
+                },
+                source_chain,
+                ["ETF earnings statements are not applicable."],
+            ),
+            "institution": self._build_fundamental_block(
+                "not_supported",
+                {},
+                source_chain,
+                ["ETF holder breakdown is not implemented."],
+            ),
+            "capital_flow": self._build_fundamental_block(
+                "not_supported",
+                {},
+                source_chain,
+                ["ETF fund flow/NAV data source is not configured."],
+            ),
+            "dragon_tiger": self._build_fundamental_block(
+                "not_supported",
+                {},
+                source_chain,
+                ["dragon tiger data is not applicable to ETF context."],
+            ),
+            "boards": self._build_fundamental_block(
+                "not_supported",
+                {},
+                source_chain,
+                ["ETF board membership should be inferred from holdings/sector exposure."],
+            ),
+        }
+        coverage = {block: blocks[block]["status"] for block in blocks}
+        status = "not_supported" if all(value == "not_supported" for value in coverage.values()) else "partial"
+        return {
+            "market": market,
+            "status": status,
+            "provider": "etf_context",
+            "asset_type": "etf",
+            "symbol": symbol,
+            "fund_profile": fund_profile,
+            "etf_context": etf_payload,
+            "quote": quote_dict,
+            "coverage": coverage,
+            "source_chain": source_chain,
+            "errors": errors,
+            "elapsed_ms": int((time.time() - started) * 1000),
+            **blocks,
+        }
+
     def _get_us_fundamental_context(self, stock_code: str) -> Dict[str, Any]:
         """Build a fail-open US fundamental context from SEC EDGAR and quotes."""
         from src.config import get_config
@@ -2166,16 +2404,37 @@ class DataFetcherManager:
             sec_timeout,
             "sec_edgar",
         )
+        fetch_timeout = max(
+            0.0,
+            float(getattr(config, "fundamental_fetch_timeout_seconds", 3.0) or 3.0),
+        )
         if not isinstance(sec_payload, dict):
+            quote_payload = None
+            quote_err_msg = ""
+            if fetch_timeout > 0:
+                quote_payload, quote_err_msg, _quote_ms = self._run_with_retry(
+                    lambda: self.get_realtime_quote(ticker, log_final_failure=False),
+                    fetch_timeout,
+                    "us_realtime_quote",
+                )
+            quote_name = getattr(quote_payload, "name", "") if quote_payload is not None else ""
+            if _looks_like_us_etf_name(quote_name):
+                reason = sec_err_msg or "SEC EDGAR unavailable"
+                if quote_err_msg:
+                    reason = f"{reason}; quote fallback: {quote_err_msg}"
+                return self._build_etf_fundamental_context(
+                    ticker,
+                    "us",
+                    config,
+                    quote_payload=quote_payload,
+                    reason=reason,
+                    start_ts=start_ts,
+                )
             return self._build_market_not_supported(
                 market="us",
                 reason=sec_err_msg or "SEC EDGAR unavailable",
             )
 
-        fetch_timeout = max(
-            0.0,
-            float(getattr(config, "fundamental_fetch_timeout_seconds", 3.0) or 3.0),
-        )
         if fetch_timeout > 0:
             quote_payload, quote_err_msg, quote_ms = self._run_with_retry(
                 lambda: self.get_realtime_quote(ticker, log_final_failure=False),
@@ -2346,7 +2605,9 @@ class DataFetcherManager:
 
         stock_code = normalize_stock_code(stock_code)
         market = _market_tag(stock_code)
-        is_etf = _is_etf_code(stock_code)
+        is_etf = _is_etf_code(stock_code) or (market == "us" and _is_known_us_etf_code(stock_code))
+        if is_etf:
+            return self._build_etf_fundamental_context(stock_code, market, config)
         if market == "us":
             if getattr(config, "sec_edgar_enabled", False):
                 return self._get_us_fundamental_context(stock_code)

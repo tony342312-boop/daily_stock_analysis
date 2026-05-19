@@ -167,6 +167,66 @@ class TestFundamentalContext(unittest.TestCase):
         self.assertEqual(ctx["coverage"].get("dragon_tiger"), "not_supported")
         self.assertEqual(ctx["coverage"].get("boards"), "not_supported")
 
+    def test_known_us_etf_uses_fund_context_without_sec(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+            sec_edgar_enabled=True,
+        )
+        quote = SimpleNamespace(
+            code="DRAM",
+            name="Roundhill Memory ETF",
+            price=51.1,
+            change_pct=0.4,
+            source=SimpleNamespace(value="mock_quote"),
+        )
+        with patch("src.config.get_config", return_value=cfg), \
+                patch.object(manager, "get_realtime_quote", return_value=quote), \
+                patch("data_provider.etf_context.EtfContextClient._merge_yfinance_fund_data"), \
+                patch("data_provider.sec_edgar.SecEdgarClient.get_company_context") as sec_mock:
+            ctx = manager.get_fundamental_context("DRAM.US")
+
+        self.assertEqual(ctx["market"], "us")
+        self.assertEqual(ctx["asset_type"], "etf")
+        self.assertEqual(ctx["provider"], "etf_context")
+        self.assertEqual(ctx["symbol"], "DRAM")
+        self.assertEqual(ctx["coverage"].get("valuation"), "ok")
+        self.assertEqual(ctx["coverage"].get("earnings"), "not_supported")
+        self.assertFalse(ctx["fund_profile"]["company_financial_report_applicable"])
+        self.assertEqual(ctx["earnings"]["data"]["financial_report"]["source"], "not_applicable")
+        sec_mock.assert_not_called()
+
+    def test_us_sec_failure_falls_back_to_etf_name_context(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+            sec_edgar_enabled=True,
+            sec_edgar_user_agent="unit-test example@example.com",
+            sec_edgar_timeout_seconds=0.5,
+        )
+        quote = SimpleNamespace(
+            code="FNDX",
+            name="Example Income ETF",
+            price=28.5,
+            source=SimpleNamespace(value="mock_quote"),
+        )
+        with patch("src.config.get_config", return_value=cfg), \
+                patch("data_provider.sec_edgar.SecEdgarClient.get_company_context",
+                      side_effect=RuntimeError("ticker not found")), \
+                patch.object(manager, "get_realtime_quote", return_value=quote), \
+                patch("data_provider.etf_context.EtfContextClient._merge_yfinance_fund_data"):
+            ctx = manager.get_fundamental_context("FNDX.US")
+
+        self.assertEqual(ctx["market"], "us")
+        self.assertEqual(ctx["asset_type"], "etf")
+        self.assertEqual(ctx["symbol"], "FNDX")
+        self.assertEqual(ctx["coverage"].get("earnings"), "not_supported")
+        self.assertIn("not_applicable", ctx["earnings"]["data"]["financial_report"]["source"])
+
     def test_sector_rankings_use_ordered_fallback(self) -> None:
         akshare = _DummyFetcher("AkshareFetcher", priority=5, rankings=None)
         tushare = _DummyFetcher(
