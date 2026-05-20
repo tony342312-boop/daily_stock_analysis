@@ -15,7 +15,7 @@
 
 > 🤖 基于 AI 大模型的 A股/港股/美股自选股智能分析系统，每日自动分析并推送「决策仪表盘」到企业微信/飞书/Telegram/Discord/Slack/邮箱
 
-[**产品预览**](#-产品预览) · [**功能特性**](#-功能特性) · [**快速开始**](#-快速开始) · [**推送效果**](#-推送效果) · [**文档中心**](docs/INDEX.md) · [**完整指南**](docs/full-guide.md)
+[**产品预览**](#-产品预览) · [**功能特性**](#-功能特性) · [**快速开始**](#-快速开始) · [**推送效果**](#-推送效果) · [**文档中心**](docs/INDEX.md) · [**完整指南**](docs/full-guide.md) · [**二次开发记录**](#-二次开发更新记录)
 
 简体中文 | [English](docs/README_EN.md) | [繁體中文](docs/README_CHT.md)
 
@@ -273,6 +273,15 @@ python main.py --webui-only
     <td valign="top"><a href="https://github.com/ZhuLinsen/daily_stock_analysis/issues">提交 Issue</a></td>
   </tr>
 </table>
+
+## 🧾 二次开发更新记录
+
+本仓库为基于 [ZhuLinsen/daily_stock_analysis](https://github.com/ZhuLinsen/daily_stock_analysis) 的 fork / 二次开发版本，保留原项目 MIT License 与作者署名。以下版本号用于记录本 fork 的阶段性改动，不代表上游官方版本号。
+
+| 版本 | 更新日期 | 更新内容 |
+|------|----------|----------|
+| v0.1 | 2026-05-18 | 完成 WebUI 测试站与本地开发工作流整理，补充注册验证码、管理员历史记录、用户上下文展示、SEA / Shopee / Sea Limited / 虾皮 到 `SE` 的搜索修正，以及反馈入口的初步能力。 |
+| v0.2 | 2026-05-20 | 将测试站 WIP 拆分为小分支并合并到本 fork `main`：增强跨市场搜索别名覆盖；接入 SEC EDGAR 美股财报字段、FRED 宏观、同行估值、ETF 基本面上下文；补充 Exa、DuckDuckGo、Google News RSS、Bing News RSS 等搜索源；加入 WebUI 部署示例、报告 PDF 导出脚本与移动端滚动体验修复。 |
 
 ## 📄 License
 
