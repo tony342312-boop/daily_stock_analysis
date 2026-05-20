@@ -22,6 +22,20 @@ export type CaptchaResponse = {
   captchaToken: string;
 };
 
+export type AppUser = {
+  id: number;
+  username: string;
+  role: 'admin' | 'user';
+  status: 'active' | 'disabled';
+  createdAt?: string | null;
+  lastLoginAt?: string | null;
+};
+
+export type UserListResponse = {
+  total: number;
+  items: AppUser[];
+};
+
 export const authApi = {
   async getStatus(): Promise<AuthStatusResponse> {
     const { data } = await apiClient.get<AuthStatusResponse>('/api/v1/auth/status');
@@ -97,6 +111,19 @@ export const authApi = {
       newPassword,
       newPasswordConfirm,
     });
+  },
+
+  async listUsers(): Promise<UserListResponse> {
+    const { data } = await apiClient.get<UserListResponse>('/api/v1/auth/users');
+    return data;
+  },
+
+  async updateUser(
+    userId: number,
+    updates: { role?: 'admin' | 'user'; status?: 'active' | 'disabled'; password?: string }
+  ): Promise<{ ok: boolean; user: AppUser }> {
+    const { data } = await apiClient.patch<{ ok: boolean; user: AppUser }>(`/api/v1/auth/users/${userId}`, updates);
+    return data;
   },
 
   async logout(): Promise<void> {

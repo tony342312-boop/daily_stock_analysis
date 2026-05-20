@@ -16,6 +16,7 @@ import {
   SettingsLoading,
   SettingsPanelErrorBoundary,
   SettingsSectionCard,
+  UserManagementCard,
 } from '../components/settings';
 import { WEB_BUILD_INFO } from '../utils/constants';
 import { getCategoryDescriptionZh } from '../utils/systemConfigI18n';
@@ -598,6 +599,7 @@ const SettingsPage: React.FC = () => {
 
           <section className="space-y-4">
             {activeCategory === 'system' ? <AuthSettingsCard /> : null}
+            {activeCategory === 'system' ? <UserManagementCard /> : null}
             {activeCategory === 'system' ? (
               <SettingsSectionCard
                 title="版本信息"
