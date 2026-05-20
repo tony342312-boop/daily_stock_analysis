@@ -6,7 +6,7 @@ A股自选股智能分析系统 - 搜索服务模块
 
 职责：
 1. 提供统一的新闻搜索接口
-2. 支持 Bocha、Tavily、Brave、SerpAPI、SearXNG 多种搜索引擎
+2. 支持 Bocha、Tavily、Brave、SerpAPI、SearXNG、DuckDuckGo/RSS 多种搜索引擎
 3. 多 Key 负载均衡和故障转移
 4. 搜索结果缓存和格式化
 """
@@ -15,10 +15,12 @@ import logging
 import re
 import threading
 import time
+import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from html.parser import HTMLParser
 from typing import List, Dict, Any, Optional, Tuple
 from itertools import cycle
 from urllib.parse import parse_qsl, unquote, urlparse
@@ -419,6 +421,147 @@ class TavilySearchProvider(BaseSearchProvider):
             return domain or '未知来源'
         except Exception:
             return '未知来源'
+
+
+class ExaSearchProvider(BaseSearchProvider):
+    """
+    Exa Search API provider.
+
+    Uses the raw HTTP API to avoid adding another runtime dependency. The
+    default mode is Exa's `auto` search type with highlights, which is a good
+    fit for LLM report context because it returns compact source excerpts.
+    """
+
+    SEARCH_URL = "https://api.exa.ai/search"
+    TIMEOUT_SECONDS = 15
+
+    def __init__(self, api_keys: List[str]):
+        super().__init__(api_keys, "Exa")
+
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+        start_date = (datetime.now(timezone.utc) - timedelta(days=max(1, days))).date().isoformat()
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+        }
+        payload = {
+            "query": query,
+            "type": "auto",
+            "numResults": max(1, min(int(max_results), 10)),
+            "category": "news",
+            "userLocation": "US",
+            "startPublishedDate": start_date,
+            "contents": {
+                "highlights": True,
+            },
+        }
+
+        try:
+            response = _post_with_retry(
+                self.SEARCH_URL,
+                headers=headers,
+                json=payload,
+                timeout=self.TIMEOUT_SECONDS,
+            )
+            if response.status_code != 200:
+                return SearchResponse(
+                    query=query,
+                    results=[],
+                    provider=self.name,
+                    success=False,
+                    error_message=self._parse_http_error(response),
+                )
+
+            data = response.json()
+            raw_results = data.get("results", []) if isinstance(data, dict) else []
+            if not isinstance(raw_results, list):
+                raw_results = []
+
+            results: List[SearchResult] = []
+            for item in raw_results:
+                if not isinstance(item, dict):
+                    continue
+                url = item.get("url") or item.get("id") or ""
+                title = item.get("title") or ""
+                if not url or not title:
+                    continue
+
+                snippet = self._extract_snippet(item)
+                results.append(
+                    SearchResult(
+                        title=title,
+                        snippet=snippet[:500],
+                        url=url,
+                        source=self._extract_domain(url),
+                        published_date=item.get("publishedDate") or item.get("published_date"),
+                    )
+                )
+                if len(results) >= max_results:
+                    break
+
+            return SearchResponse(query=query, results=results, provider=self.name, success=True)
+
+        except requests.exceptions.Timeout:
+            return SearchResponse(query=query, results=[], provider=self.name, success=False, error_message="请求超时")
+        except requests.exceptions.RequestException as e:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=f"网络请求失败: {e}",
+            )
+        except Exception as e:
+            return SearchResponse(query=query, results=[], provider=self.name, success=False, error_message=str(e))
+
+    @staticmethod
+    def _extract_snippet(item: Dict[str, Any]) -> str:
+        highlights = item.get("highlights") or []
+        parts: List[str] = []
+        if isinstance(highlights, list):
+            for highlight in highlights:
+                if isinstance(highlight, str):
+                    parts.append(highlight)
+                elif isinstance(highlight, dict):
+                    text = highlight.get("text") or highlight.get("highlight")
+                    if isinstance(text, str):
+                        parts.append(text)
+        elif isinstance(highlights, str):
+            parts.append(highlights)
+
+        if parts:
+            return " ".join(p.strip() for p in parts if p.strip())
+
+        summary = item.get("summary")
+        if isinstance(summary, str):
+            return summary
+
+        text = item.get("text")
+        if isinstance(text, str):
+            return text
+
+        return ""
+
+    @staticmethod
+    def _parse_http_error(response) -> str:
+        try:
+            data = response.json()
+            if isinstance(data, dict):
+                msg = data.get("message") or data.get("error") or data.get("detail")
+                if msg:
+                    return f"HTTP {response.status_code}: {msg}"
+                return f"HTTP {response.status_code}: {data}"
+        except Exception:
+            pass
+        return f"HTTP {response.status_code}: {getattr(response, 'text', '')[:200]}"
+
+    @staticmethod
+    def _extract_domain(url: str) -> str:
+        try:
+            parsed = urlparse(url)
+            return parsed.netloc.replace("www.", "") or "未知来源"
+        except Exception:
+            return "未知来源"
 
 
 class SerpAPISearchProvider(BaseSearchProvider):
@@ -1684,6 +1827,357 @@ class BraveSearchProvider(BaseSearchProvider):
         )
 
 
+class _DuckDuckGoHTMLParser(HTMLParser):
+    """Small parser for DuckDuckGo's static HTML result page."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.results: List[Dict[str, str]] = []
+        self._current: Optional[Dict[str, str]] = None
+        self._result_depth = 0
+        self._active_field: Optional[str] = None
+
+    @staticmethod
+    def _classes(attrs: List[Tuple[str, Optional[str]]]) -> set:
+        for key, value in attrs:
+            if key == "class" and value:
+                return set(value.split())
+        return set()
+
+    @staticmethod
+    def _attr(attrs: List[Tuple[str, Optional[str]]], name: str) -> str:
+        for key, value in attrs:
+            if key == name and value:
+                return value
+        return ""
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        classes = self._classes(attrs)
+        if self._current is None and tag == "div" and "result" in classes:
+            self._current = {"title": "", "url": "", "snippet": ""}
+            self._result_depth = 1
+            return
+
+        if self._current is None:
+            return
+
+        if tag == "div":
+            self._result_depth += 1
+        if tag == "a" and "result__a" in classes:
+            self._current["url"] = self._attr(attrs, "href")
+            self._active_field = "title"
+        elif "result__snippet" in classes:
+            self._active_field = "snippet"
+
+    def handle_data(self, data: str) -> None:
+        if self._current is None or self._active_field is None:
+            return
+        value = data.strip()
+        if value:
+            existing = self._current.get(self._active_field, "")
+            self._current[self._active_field] = f"{existing} {value}".strip()
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._current is None:
+            return
+        if tag == "a" and self._active_field == "title":
+            self._active_field = None
+        elif tag in {"a", "div"} and self._active_field == "snippet":
+            self._active_field = None
+
+        if tag == "div":
+            self._result_depth -= 1
+            if self._result_depth <= 0:
+                if self._current.get("title") and self._current.get("url"):
+                    self.results.append(self._current)
+                self._current = None
+                self._active_field = None
+                self._result_depth = 0
+
+
+class DuckDuckGoSearchProvider(BaseSearchProvider):
+    """DuckDuckGo HTML search provider (free, no API key)."""
+
+    SEARCH_URL = "https://html.duckduckgo.com/html/"
+    TIMEOUT_SECONDS = 10
+
+    def __init__(self, enabled: bool = True):
+        super().__init__(["__free__"] if enabled else [], "DuckDuckGo")
+
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/121.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+        }
+        try:
+            response = _get_with_retry(
+                self.SEARCH_URL,
+                headers=headers,
+                params={"q": query},
+                timeout=self.TIMEOUT_SECONDS,
+            )
+            if response.status_code != 200:
+                return SearchResponse(
+                    query=query,
+                    results=[],
+                    provider=self.name,
+                    success=False,
+                    error_message=f"HTTP {response.status_code}: {response.text[:200]}",
+                )
+
+            parser = _DuckDuckGoHTMLParser()
+            parser.feed(response.text)
+            results: List[SearchResult] = []
+            for item in parser.results:
+                title = item.get("title", "")
+                raw_url = item.get("url", "")
+                url = self._unwrap_duckduckgo_url(raw_url)
+                if not title or not url:
+                    continue
+                snippet = item.get("snippet", "")
+                results.append(
+                    SearchResult(
+                        title=title,
+                        snippet=snippet[:500],
+                        url=url,
+                        source=self._extract_domain(url),
+                    )
+                )
+                if len(results) >= max_results:
+                    break
+
+            return SearchResponse(query=query, results=results, provider=self.name, success=True)
+
+        except requests.exceptions.Timeout:
+            return SearchResponse(query=query, results=[], provider=self.name, success=False, error_message="请求超时")
+        except requests.exceptions.RequestException as e:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=f"网络请求失败: {e}",
+            )
+
+    @staticmethod
+    def _unwrap_duckduckgo_url(url: str) -> str:
+        try:
+            parsed = urlparse(url)
+            if "duckduckgo.com" in parsed.netloc and parsed.query:
+                params = dict(parse_qsl(parsed.query))
+                if params.get("uddg"):
+                    return unquote(params["uddg"])
+            if url.startswith("//duckduckgo.com/l/"):
+                params = dict(parse_qsl(urlparse("https:" + url).query))
+                if params.get("uddg"):
+                    return unquote(params["uddg"])
+            return url
+        except Exception:
+            return url
+
+    @staticmethod
+    def _extract_domain(url: str) -> str:
+        try:
+            parsed = urlparse(url)
+            return parsed.netloc.replace("www.", "") or "未知来源"
+        except Exception:
+            return "未知来源"
+
+
+class RSSNewsSearchProvider(BaseSearchProvider):
+    """Generic no-key RSS news search provider."""
+
+    TIMEOUT_SECONDS = 10
+
+    def __init__(self, name: str, url: str, params: Dict[str, Any], enabled: bool = True):
+        super().__init__(["__free__"] if enabled else [], name)
+        self._url = url
+        self._params = params
+
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+        params = dict(self._params)
+        params["q"] = query
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/121.0 Safari/537.36"
+            ),
+            "Accept": "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
+        }
+        try:
+            response = _get_with_retry(
+                self._url,
+                headers=headers,
+                params=params,
+                timeout=self.TIMEOUT_SECONDS,
+            )
+            if response.status_code != 200:
+                return SearchResponse(
+                    query=query,
+                    results=[],
+                    provider=self.name,
+                    success=False,
+                    error_message=f"HTTP {response.status_code}: {response.text[:200]}",
+                )
+
+            root = ET.fromstring(response.content)
+            cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, days))
+            results: List[SearchResult] = []
+            for item in root.findall(".//item"):
+                title = self._text(item, "title")
+                url = self._text(item, "link")
+                if not title or not url:
+                    continue
+                pub_date_raw = self._text(item, "pubDate")
+                published_date = self._normalize_pub_date(pub_date_raw)
+                if published_date and self._is_older_than_window(pub_date_raw, cutoff):
+                    continue
+                source = self._source_from_item(item, url)
+                snippet = self._text(item, "description")
+                results.append(
+                    SearchResult(
+                        title=title,
+                        snippet=re.sub(r"<[^>]+>", "", snippet)[:500],
+                        url=url,
+                        source=source,
+                        published_date=published_date,
+                    )
+                )
+                if len(results) >= max_results:
+                    break
+
+            return SearchResponse(query=query, results=results, provider=self.name, success=True)
+
+        except ET.ParseError as e:
+            return SearchResponse(query=query, results=[], provider=self.name, success=False, error_message=f"RSS解析失败: {e}")
+        except requests.exceptions.Timeout:
+            return SearchResponse(query=query, results=[], provider=self.name, success=False, error_message="请求超时")
+        except requests.exceptions.RequestException as e:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=f"网络请求失败: {e}",
+            )
+
+    @staticmethod
+    def _text(item: ET.Element, tag: str) -> str:
+        value = item.findtext(tag)
+        return value.strip() if isinstance(value, str) else ""
+
+    @staticmethod
+    def _normalize_pub_date(value: str) -> Optional[str]:
+        if not value:
+            return None
+        try:
+            return parsedate_to_datetime(value).strftime("%Y-%m-%d")
+        except Exception:
+            return None
+
+    @staticmethod
+    def _is_older_than_window(value: str, cutoff: datetime) -> bool:
+        if not value:
+            return False
+        try:
+            dt = parsedate_to_datetime(value)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt < cutoff
+        except Exception:
+            return False
+
+    @staticmethod
+    def _source_from_item(item: ET.Element, url: str) -> str:
+        source = item.findtext("source")
+        if isinstance(source, str) and source.strip():
+            return source.strip()
+        try:
+            parsed = urlparse(url)
+            return parsed.netloc.replace("www.", "") or "未知来源"
+        except Exception:
+            return "未知来源"
+
+
+class GoogleNewsRSSSearchProvider(RSSNewsSearchProvider):
+    """Google News RSS search provider (free, no API key)."""
+
+    def __init__(self, enabled: bool = True):
+        super().__init__(
+            "GoogleNewsRSS",
+            "https://news.google.com/rss/search",
+            {"hl": "en-US", "gl": "US", "ceid": "US:en"},
+            enabled=enabled,
+        )
+
+
+class BingNewsRSSSearchProvider(RSSNewsSearchProvider):
+    """Bing News RSS search provider (free, no API key)."""
+
+    def __init__(self, enabled: bool = True):
+        super().__init__(
+            "BingNewsRSS",
+            "https://www.bing.com/news/search",
+            {"format": "rss", "cc": "US", "setlang": "en-US"},
+            enabled=enabled,
+        )
+
+
+class MultiSearchEngineProvider(BaseSearchProvider):
+    """Aggregate several free no-key search engines and de-duplicate results."""
+
+    def __init__(self, providers: List[BaseSearchProvider]):
+        active = [p for p in providers if p.is_available]
+        super().__init__(["__free__"] if active else [], "MultiSearch")
+        self._free_providers = active
+
+    @property
+    def is_available(self) -> bool:
+        return bool(self._free_providers)
+
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+        return self.search(query, max_results=max_results, days=days)
+
+    def search(self, query: str, max_results: int = 5, days: int = 7) -> SearchResponse:
+        start_time = time.time()
+        seen_urls = set()
+        merged: List[SearchResult] = []
+        errors: List[str] = []
+
+        for provider in self._free_providers:
+            response = provider.search(query, max_results=max(max_results, 3), days=days)
+            if not response.success:
+                errors.append(f"{provider.name}: {response.error_message or '未知错误'}")
+                continue
+            for result in response.results:
+                normalized_url = result.url.split("#", 1)[0].rstrip("/")
+                if not normalized_url or normalized_url in seen_urls:
+                    continue
+                seen_urls.add(normalized_url)
+                merged.append(result)
+
+        merged.sort(
+            key=lambda item: (
+                item.published_date is not None,
+                item.published_date or "",
+            ),
+            reverse=True,
+        )
+        limited = merged[:max_results]
+
+        return SearchResponse(
+            query=query,
+            results=limited,
+            provider=self.name,
+            success=bool(limited) or not errors,
+            error_message="；".join(errors[:3]) if errors and not limited else None,
+            search_time=time.time() - start_time,
+        )
+
+
 class SearXNGSearchProvider(BaseSearchProvider):
     """
     SearXNG search engine (self-hosted, no quota).
@@ -2121,12 +2615,17 @@ class SearchService:
         self,
         bocha_keys: Optional[List[str]] = None,
         tavily_keys: Optional[List[str]] = None,
+        exa_keys: Optional[List[str]] = None,
         anspire_keys: Optional[List[str]] = None,
         brave_keys: Optional[List[str]] = None,
         serpapi_keys: Optional[List[str]] = None,
         minimax_keys: Optional[List[str]] = None,
         searxng_base_urls: Optional[List[str]] = None,
         searxng_public_instances_enabled: bool = True,
+        ddg_search_enabled: bool = False,
+        google_news_rss_enabled: bool = False,
+        bing_news_rss_enabled: bool = False,
+        multi_search_engine_enabled: bool = False,
         news_max_age_days: int = 3,
         news_strategy_profile: str = "short",
     ):
@@ -2136,12 +2635,17 @@ class SearchService:
         Args:
             bocha_keys: 博查搜索 API Key 列表
             tavily_keys: Tavily API Key 列表
+            exa_keys: Exa API Key 列表
             anspire_keys: Anspire Search API Key 列表
             brave_keys: Brave Search API Key 列表
             serpapi_keys: SerpAPI Key 列表
             minimax_keys: MiniMax API Key 列表
             searxng_base_urls: SearXNG 实例地址列表（自建无配额兜底）
             searxng_public_instances_enabled: 未配置自建实例时，是否自动使用公共 SearXNG 实例
+            ddg_search_enabled: 是否启用 DuckDuckGo 免费 HTML 搜索
+            google_news_rss_enabled: 是否启用 Google News RSS 免费新闻搜索
+            bing_news_rss_enabled: 是否启用 Bing News RSS 免费新闻搜索
+            multi_search_engine_enabled: 是否启用免费多搜索引擎聚合
             news_max_age_days: 新闻最大时效（天）
             news_strategy_profile: 新闻窗口策略档位（ultra_short/short/medium/long）
         """
@@ -2174,22 +2678,47 @@ class SearchService:
             self._providers.append(TavilySearchProvider(tavily_keys))
             logger.info(f"已配置 Tavily 搜索，共 {len(tavily_keys)} 个 API Key")
 
-        # 3. Brave Search（隐私优先，全球覆盖）
+        # 3. Exa（AI agent 友好的语义搜索和 highlights 摘要）
+        if exa_keys:
+            self._providers.append(ExaSearchProvider(exa_keys))
+            logger.info(f"已配置 Exa 搜索，共 {len(exa_keys)} 个 API Key")
+
+        # 4. Brave Search（隐私优先，全球覆盖）
         if brave_keys:
             self._providers.append(BraveSearchProvider(brave_keys))
             logger.info(f"已配置 Brave 搜索，共 {len(brave_keys)} 个 API Key")
 
-        # 4. SerpAPI 作为备选（每月 100 次）
+        # 5. SerpAPI 作为备选（每月 100 次）
         if serpapi_keys:
             self._providers.append(SerpAPISearchProvider(serpapi_keys))
             logger.info(f"已配置 SerpAPI 搜索，共 {len(serpapi_keys)} 个 API Key")
 
-        # 5. MiniMax（Coding Plan Web Search，结构化结果）
+        # 6. MiniMax（Coding Plan Web Search，结构化结果）
         if minimax_keys:
             self._providers.append(MiniMaxSearchProvider(minimax_keys))
             logger.info(f"已配置 MiniMax 搜索，共 {len(minimax_keys)} 个 API Key")
 
-        # 6. SearXNG（自建实例优先；未配置时可自动发现公共实例）
+        # 7. Free multi-search fallback (no API key required)
+        free_search_providers: List[BaseSearchProvider] = []
+        if ddg_search_enabled:
+            free_search_providers.append(DuckDuckGoSearchProvider(enabled=True))
+        if google_news_rss_enabled:
+            free_search_providers.append(GoogleNewsRSSSearchProvider(enabled=True))
+        if bing_news_rss_enabled:
+            free_search_providers.append(BingNewsRSSSearchProvider(enabled=True))
+
+        if multi_search_engine_enabled and free_search_providers:
+            self._providers.append(MultiSearchEngineProvider(free_search_providers))
+            logger.info(
+                "已启用免费多搜索聚合，共 %s 个来源: %s",
+                len(free_search_providers),
+                ", ".join(p.name for p in free_search_providers),
+            )
+        elif ddg_search_enabled:
+            self._providers.append(DuckDuckGoSearchProvider(enabled=True))
+            logger.info("已启用 DuckDuckGo 免费搜索")
+
+        # 8. SearXNG（自建实例优先；未配置时可自动发现公共实例）
         searxng_provider = SearXNGSearchProvider(
             searxng_base_urls,
             use_public_instances=bool(searxng_public_instances_enabled and not searxng_base_urls),
@@ -2201,7 +2730,7 @@ class SearchService:
             else:
                 logger.info("已启用 SearXNG 公共实例自动发现模式")
 
-        # 7. Anspire Search（实时智能搜索优化）
+        # 9. Anspire Search（实时智能搜索优化）
         if anspire_keys:
             self._providers.insert(0, AnspireSearchProvider(anspire_keys))
             logger.info(f"已配置 Anspire Search 搜索，共 {len(anspire_keys)} 个 API Key")
@@ -2998,6 +3527,33 @@ class SearchService:
                     'strict_freshness': False,
                 },
                 {
+                    'name': 'official_releases',
+                    'query': (
+                        f"{stock_name} {stock_code} earnings results buyback annual report "
+                        "investor relations BusinessWire GlobeNewswire"
+                    ),
+                    'desc': '公司公告与财报新闻',
+                    'tavily_topic': 'news',
+                    'strict_freshness': True,
+                },
+                {
+                    'name': 'global_macro_news',
+                    'query': (
+                        "Federal Reserve interest rates inflation Treasury yields "
+                        "US economy stock market global markets latest news"
+                    ),
+                    'desc': '全球宏观新闻',
+                    'tavily_topic': 'news',
+                    'strict_freshness': True,
+                },
+                {
+                    'name': 'insider_activity',
+                    'query': f"{stock_name} {stock_code} Form 4 insider trading insider selling recent",
+                    'desc': '内部人交易',
+                    'tavily_topic': None,
+                    'strict_freshness': False,
+                },
+                {
                     'name': 'risk_check',
                     'query': (
                         f"{stock_name} {stock_code} index performance outlook tracking error"
@@ -3178,12 +3734,25 @@ class SearchService:
         lines = [f"【{stock_name} 情报搜索结果】"]
         
         # 维度展示顺序
-        display_order = ['latest_news', 'announcements', 'market_analysis', 'risk_check', 'earnings', 'industry']
+        display_order = [
+            'latest_news',
+            'official_releases',
+            'announcements',
+            'market_analysis',
+            'global_macro_news',
+            'insider_activity',
+            'risk_check',
+            'earnings',
+            'industry',
+        ]
 
         dim_labels = {
             'latest_news': '📰 最新消息',
+            'official_releases': '📣 公司公告与财报新闻',
             'announcements': '📋 公司公告',
             'market_analysis': '📈 机构分析',
+            'global_macro_news': '🌐 全球宏观新闻',
+            'insider_activity': '🧾 内部人交易',
             'risk_check': '⚠️ 风险排查',
             'earnings': '📊 业绩预期',
             'industry': '🏭 行业分析',
@@ -3438,12 +4007,17 @@ def get_search_service() -> SearchService:
                 _search_service = SearchService(
                     bocha_keys=config.bocha_api_keys,
                     tavily_keys=config.tavily_api_keys,
+                    exa_keys=getattr(config, "exa_api_keys", []),
                     anspire_keys=config.anspire_api_keys,
                     brave_keys=config.brave_api_keys,
                     serpapi_keys=config.serpapi_keys,
                     minimax_keys=config.minimax_api_keys,
                     searxng_base_urls=config.searxng_base_urls,
                     searxng_public_instances_enabled=config.searxng_public_instances_enabled,
+                    ddg_search_enabled=getattr(config, "ddg_search_enabled", False),
+                    google_news_rss_enabled=getattr(config, "google_news_rss_enabled", False),
+                    bing_news_rss_enabled=getattr(config, "bing_news_rss_enabled", False),
+                    multi_search_engine_enabled=getattr(config, "multi_search_engine_enabled", False),
                     news_max_age_days=config.news_max_age_days,
                     news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
                 )

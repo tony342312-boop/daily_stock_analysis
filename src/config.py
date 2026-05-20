@@ -597,10 +597,15 @@ class Config:
     bocha_api_keys: List[str] = field(default_factory=list)  # Bocha API Keys
     minimax_api_keys: List[str] = field(default_factory=list)  # MiniMax API Keys
     tavily_api_keys: List[str] = field(default_factory=list)  # Tavily API Keys
+    exa_api_keys: List[str] = field(default_factory=list)  # Exa API Keys
     brave_api_keys: List[str] = field(default_factory=list)  # Brave Search API Keys
     serpapi_keys: List[str] = field(default_factory=list)  # SerpAPI Keys
     searxng_base_urls: List[str] = field(default_factory=list)  # SearXNG instance URLs (self-hosted, no quota)
     searxng_public_instances_enabled: bool = True  # Auto-discover public SearXNG instances when base URLs are absent
+    ddg_search_enabled: bool = False  # DuckDuckGo HTML fallback (free, no key)
+    google_news_rss_enabled: bool = False  # Google News RSS fallback (free, no key)
+    bing_news_rss_enabled: bool = False  # Bing News RSS fallback (free, no key)
+    multi_search_engine_enabled: bool = False  # Aggregate free search fallbacks
 
     # === Social Sentiment (US stocks only, api.adanos.org) ===
     social_sentiment_api_key: Optional[str] = None
@@ -1221,6 +1226,14 @@ class Config:
         
         tavily_keys_str = os.getenv('TAVILY_API_KEYS', '')
         tavily_api_keys = [k.strip() for k in tavily_keys_str.split(',') if k.strip()]
+
+        exa_keys_str = ",".join(
+            v for v in (os.getenv('EXA_API_KEYS', ''), os.getenv('EXA_API_KEY', '')) if v
+        )
+        exa_api_keys: List[str] = []
+        for key in [k.strip() for k in exa_keys_str.split(',') if k.strip()]:
+            if key not in exa_api_keys:
+                exa_api_keys.append(key)
         
         serpapi_keys_str = os.getenv('SERPAPI_API_KEYS', '')
         serpapi_keys = [k.strip() for k in serpapi_keys_str.split(',') if k.strip()]
@@ -1245,6 +1258,22 @@ class Config:
         searxng_public_instances_enabled = parse_env_bool(
             os.getenv('SEARXNG_PUBLIC_INSTANCES_ENABLED'),
             default=True,
+        )
+        ddg_search_enabled = parse_env_bool(
+            os.getenv('DDG_SEARCH_ENABLED'),
+            default=False,
+        )
+        google_news_rss_enabled = parse_env_bool(
+            os.getenv('GOOGLE_NEWS_RSS_ENABLED'),
+            default=False,
+        )
+        bing_news_rss_enabled = parse_env_bool(
+            os.getenv('BING_NEWS_RSS_ENABLED'),
+            default=False,
+        )
+        multi_search_engine_enabled = parse_env_bool(
+            os.getenv('MULTI_SEARCH_ENGINE_ENABLED'),
+            default=False,
         )
 
         # 企微消息类型与最大字节数逻辑
@@ -1364,10 +1393,15 @@ class Config:
             bocha_api_keys=bocha_api_keys,
             minimax_api_keys=minimax_api_keys,
             tavily_api_keys=tavily_api_keys,
+            exa_api_keys=exa_api_keys,
             brave_api_keys=brave_api_keys,
             serpapi_keys=serpapi_keys,
             searxng_base_urls=searxng_base_urls,
             searxng_public_instances_enabled=searxng_public_instances_enabled,
+            ddg_search_enabled=ddg_search_enabled,
+            google_news_rss_enabled=google_news_rss_enabled,
+            bing_news_rss_enabled=bing_news_rss_enabled,
+            multi_search_engine_enabled=multi_search_engine_enabled,
             social_sentiment_api_key=os.getenv('SOCIAL_SENTIMENT_API_KEY') or None,
             social_sentiment_api_url=os.getenv('SOCIAL_SENTIMENT_API_URL', 'https://api.adanos.org').rstrip('/'),
             news_max_age_days=parse_env_int(os.getenv('NEWS_MAX_AGE_DAYS'), 3, field_name='NEWS_MAX_AGE_DAYS', minimum=1),
@@ -2242,8 +2276,13 @@ class Config:
             or self.bocha_api_keys
             or self.minimax_api_keys
             or self.tavily_api_keys
+            or self.exa_api_keys
             or self.brave_api_keys
             or self.serpapi_keys
+            or self.ddg_search_enabled
+            or self.google_news_rss_enabled
+            or self.bing_news_rss_enabled
+            or self.multi_search_engine_enabled
             or self.has_searxng_enabled()
         )
 
